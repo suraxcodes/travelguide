@@ -16,61 +16,17 @@ from collections import OrderedDict
 from autogen_agentchat.agents import AssistantAgent 
 from autogen_agentchat.teams import MagenticOneGroupChat
 from autogen_ext.models.openai import OpenAIChatCompletionClient
-API_KEYS = []
-current_key_index = 0
-key_rotation_enabled = True
 
-#api key rotation functions
-def load_and_rotate_keys():
-    """Load API keys from api.txt and rotate when current key fails"""
-    global API_KEYS, current_key_index, key_rotation_enabled
-    
-    # Load keys only once
-    if not API_KEYS:
-        try:
-            if os.path.exists("api.txt"):
-                with open("api.txt", "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith('#'):  # Skip empty lines and comments
-                            API_KEYS.append(line)
-            
-            # Also check environment variable
-            env_key = os.getenv("OPENROUTER_KEY")
-            if env_key and env_key.strip():
-                API_KEYS.append(env_key.strip())
-            
-            if not API_KEYS:
-                print("❌ No API keys found! Please add keys to api.txt file")
-                key_rotation_enabled = False
-                return None
-            
-            print(f"✅ Loaded {len(API_KEYS)} API keys")
-            
-        except Exception as e:
-            print(f"❌ Error loading API keys: {e}")
-            key_rotation_enabled = False
-            return None
-    
-    # Get current key
-    if current_key_index >= len(API_KEYS):
-        current_key_index = 0
-    
-    return API_KEYS[current_key_index]
+CACHE_FILE = Path("location_cache.json")
+if CACHE_FILE.exists():
+    with open(CACHE_FILE, "r", encoding="utf-8") as f:
+        LOCATION_CACHE = json.load(f)
+else:
+    LOCATION_CACHE = {}
 
-def rotate_to_next_key():
-    """Rotate to next API key"""
-    global API_KEYS, current_key_index, key_rotation_enabled
-    
-    if not key_rotation_enabled or len(API_KEYS) <= 1:
-        return False
-    
-    old_index = current_key_index
-    current_key_index = (current_key_index + 1) % len(API_KEYS)
-    
-    print(f"🔄 Rotating API key: {old_index + 1} → {current_key_index + 1} (Total: {len(API_KEYS)})")
-    return True
-
+def save_cache():
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(LOCATION_CACHE, f, indent=2, ensure_ascii=False)
 
 # ===== DYNAMIC MAP FUNCTIONS =====
 
@@ -898,20 +854,18 @@ Respond ONLY with JSON in this exact format:
 # Team configuration
 def teamConfig():
     current_date = datetime.now().strftime("%B %d, %Y")
-    
-    # Get current API key with rotation support
-    api_key = load_and_rotate_keys()
-    if not api_key:
-        raise RuntimeError("No OpenRouter API key found.")
-    
+    openrouter_key = os.getenv("OPENROUTER_KEY")
+    if not openrouter_key:
+        if os.path.exists("api.txt"):
+            openrouter_key = open("api.txt").read().strip()
+        else:
+            raise RuntimeError("No OpenRouter API key found. Set OPENROUTER_KEY or create api.txt.")
     model = OpenAIChatCompletionClient(
         model="gpt-4o-mini",
-        api_key=api_key,
+        api_key=openrouter_key,
         base_url="https://openrouter.ai/api/v1",
         max_tokens=500
     )
-    
-    #agents 
     content_classifier_agent = create_classifier_agent(model, current_date)
     smart_location_agent = create_smart_location_agent(model, current_date)
     description_agent = AssistantAgent(
@@ -1093,11 +1047,9 @@ Return ONLY a JSON object in this format:
             transportation_options_agent), model
 
 # Safe run agent with retries
-# Safe run agent with retries and API key rotation
-async def safe_run(agent, task, max_retries=3):
-    """Safely runs an agent with retries and automatic API key rotation"""
-    
-    for attempt in range(max_retries):
+async def safe_run(agent, task, retries=2):
+    """Safely runs an agent with retries and returns its output""" 
+    for attempt in range(retries):
         try:
             result = await agent.run(task=task)
             if result:
@@ -1111,55 +1063,15 @@ async def safe_run(agent, task, max_retries=3):
                         except:
                             pass
                     return content
-            return None
-            
-        except Exception as e:
-            error_msg = str(e).lower()
-            print(f"Attempt {attempt + 1}/{max_retries} failed: {error_msg[:100]}")
-            
-            # Check if this is an API key error (expired, rate limit, etc.)
-            is_key_error = any(keyword in error_msg for keyword in [
-                'quota', 'limit', 'exceeded', 'expired', 'invalid', 'authentication',
-                'api key', 'rate limit', 'insufficient', 'balance'
-            ])
-            
-            # If it's a key error and we have multiple keys, rotate
-            if is_key_error and len(API_KEYS) > 1:
-                print(" Detected API key issue, rotating to next key...")
-                if rotate_to_next_key():
-                    # Get new key
-                    new_key = load_and_rotate_keys()
-                    if new_key:
-                        # Create new model with rotated key
-                        from autogen_ext.models.openai import OpenAIChatCompletionClient
-                        rotated_model = OpenAIChatCompletionClient(
-                            model="gpt-4o-mini",
-                            api_key=new_key,
-                            base_url="https://openrouter.ai/api/v1",
-                            max_tokens=500
-                        )
-                        # Update agent's model
-                        agent.model_client = rotated_model
-                        print(f" Using new API key: {current_key_index + 1}/{len(API_KEYS)}")
-            
-            # Wait before retry
-            if attempt < max_retries - 1:
-                await asyncio.sleep(1)
-    
-    # Return appropriate fallback based on agent type
+        except Exception:
+            continue
     if agent.name == "smart_location_agent":
         return {"should_fetch": False, "search_query": ""}
-    elif agent.name == "content_classifier_agent":
-        return {"type": "blog", "confidence": 0.5}
-    elif agent.name == "tags_agent":
-        return {"tags": ["#travel", "#guide"]}
-    
     return ""
-
 
 # Get boolean options
 async def get_boolean_options(content_type, user_topic, model):
-    """Determine boolean options for the content with API key rotation"""
+    """Determine boolean options for the content""" 
     current_date = datetime.now().strftime("%B %d, %Y")
     options = {
         "active": False,
@@ -1564,50 +1476,52 @@ Return a single JSON object with the following keys:
     return output, saved_file, thumbnail_file, filename_json, content_type, goa_db, formatted_json
 
 async def run_agent_original_with_validation(user_topic: str, more_details: str = None):
-    """Enhanced version with proper location validation and API key rotation"""
+    """Enhanced version with proper location validation and NO double-fetching"""
     current_date = datetime.now().strftime("%B %d, %Y")
     goa_db = get_mongodb_connection()
 
-    # Get API key with rotation support
-    api_key = load_and_rotate_keys()
-    if not api_key:
-        raise RuntimeError("No OpenRouter API key found.")
+    # Get model
+    openrouter_key = os.getenv("OPENROUTER_KEY")
+    if not openrouter_key:
+        if os.path.exists("api.txt"):
+            openrouter_key = open("api.txt").read().strip()
+        else:
+            raise RuntimeError("No OpenRouter API key found.")
 
     model = OpenAIChatCompletionClient(
         model="gpt-4o-mini",
-        api_key=api_key,
+        api_key=openrouter_key,
         base_url="https://openrouter.ai/api/v1",
         max_tokens=500
     )
 
-    print(" Classifying content type...")
+    print("🤖 Classifying content type...")
     content_type_result = await safe_run(create_classifier_agent(model, current_date), f"Classify the type for topic: {user_topic}")
     content_type = content_type_result.get("type", "blog") if isinstance(content_type_result, dict) else "blog"
-    print(f" Content type: {content_type}")
+    print(f"📝 Content type: {content_type}")
 
-    print(" Deciding if location is needed...")
+    print("📍 Deciding if location is needed...")
     location_decision = await safe_run(create_smart_location_agent(model, current_date), f"Determine if location data should be fetched for topic: {user_topic}")
     should_fetch_location = location_decision.get("should_fetch", True)
     search_query = location_decision.get("search_query", user_topic).strip()
 
-    print(f" Should fetch: {should_fetch_location} | Query: '{search_query}'")
+    print(f"📍 Should fetch: {should_fetch_location} | Query: '{search_query}'")
 
-    # Use validated location fetch
+    # THIS IS THE KEY: Use validated location fetch
     location_data = {"address": None, "latitude": 0.0, "longitude": 0.0}
     if should_fetch_location and search_query:
         location_data = await fetch_and_validate_location(user_topic, search_query, content_type, model)
         if location_data.get("error") or not location_data.get("address"):
-            print("Falling back to basic fetch...")
-            location_data = fetch_location(f"{search_query}, Goa, India")
+            print("⚠️ Falling back to basic fetch...")
+            location_data = fetch_location(f"{search_query}, Goa, India")  # Final fallback
     else:
-        print("ℹ Location not needed for this content type")
+        print("ℹ️ Location not needed for this content type")
 
-    # Get new team config with potentially rotated keys
+    # Now run all other agents (same as before)
     (content_classifier_agent, smart_location_agent, description_agent, tags_agent, content_agent,
      guidelines_agent, image_prompt_agent, thumbnail_prompt_agent, seo_title_agent,
      transportation_options_agent), model_full = teamConfig()
 
-    # Run all agents with automatic key rotation
     description = await safe_run(description_agent, f"Generate a short description for {content_type}: {user_topic}")
     tags_result = await safe_run(tags_agent, f"Generate 8-12 SEO tags for {content_type}: {user_topic}")
     content = await safe_run(content_agent, f"Generate detailed HTML content for {content_type}: {user_topic}")
