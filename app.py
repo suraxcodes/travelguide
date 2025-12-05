@@ -13,7 +13,7 @@ from optimizetreavel import (
 
 # Streamlit App Configuration
 st.set_page_config(
-    page_title="Travel Content Generator",
+    page_title="AI Powered Travel Guide ",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -21,11 +21,7 @@ st.set_page_config(
 # Sidebar for instructions and configuration
 st.sidebar.header("Quick Guide")
 st.sidebar.markdown("""
-- Enter a topic (e.g., "Colva Beach").
-- The system will check if content exists or create new.
-- Results include JSON, images, and MongoDB (if connected).
-
-Setup: Ensure API keys and dependencies (autogen, pymongo) are configured.
+- Enter a topic (e.g., "Colva Beach")
 """)
 
 # Custom CSS for map
@@ -53,7 +49,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # Main App
-st.title("Travel Content Generator")
+st.title("AI Powered Travel Guide")
 st.markdown("Ask about travel guides, event details, restaurant reviews, and more for Indian hotspots.")
 
 # Integrated Search Section
@@ -75,7 +71,7 @@ col3, col4 = st.columns([3, 1])
 with col3:
     details = st.text_area(
         "Additional Details (Optional)",
-        placeholder="e.g., Focus on water sports",
+        placeholder="e.g., state, city ",
         height=50,
         label_visibility="collapsed"
     )
@@ -144,10 +140,22 @@ if search_btn and topic.strip():
             st.error(f"Error during processing: {str(e)}")
             st.exception(e)
 
+
+
 # Display map if content is available
 if 'generated' in st.session_state and st.session_state.generated and st.session_state.output:
     output = st.session_state.output
     
+        # SEO Titles
+    st.subheader("Titles")
+    seo_titles = output.get("seoTitle", [])
+    if isinstance(seo_titles, list):
+        for i, title in enumerate(seo_titles[:2], 1):
+            st.write(f"{i}. {title}")
+    else:
+        st.write(seo_titles)
+
+
     # Display dynamic map if location data is available
     location = output.get("location", {})
     if location and location.get("latitude") and location.get("longitude"):
@@ -177,32 +185,6 @@ if 'generated' in st.session_state and st.session_state.generated and st.session
         </div>
         '''
         st.markdown(map_html, unsafe_allow_html=True)
-
-    # Display Key Outputs
-    st.header("Content Overview")
-
-    # Short Description
-    st.subheader("Short Description")
-    st.write(output.get("shortDescription", "No description available."))
-
-    # SEO Titles
-    st.subheader("SEO Titles")
-    seo_titles = output.get("seoTitle", [])
-    if isinstance(seo_titles, list):
-        for i, title in enumerate(seo_titles[:2], 1):
-            st.write(f"{i}. {title}")
-    else:
-        st.write(seo_titles)
-
-    # Tags
-    st.subheader("SEO Tags")
-    tags = output.get("tags", [])
-    if tags:
-        for tag in tags:
-            st.write(tag)
-    else:
-        st.write("No tags generated.")
-
     # Location
     st.subheader("Location Details")
     if location.get("address"):
@@ -210,6 +192,15 @@ if 'generated' in st.session_state and st.session_state.generated and st.session
         st.write(f"Lat/Lng: {location.get('latitude', 0.0)}, {location.get('longitude', 0.0)}")
     else:
         st.write("No specific location data.")
+
+    # Display Key Outputs
+    st.header("Content Overview")
+
+
+    # Short Description
+    st.subheader("Short Description")
+    st.write(output.get("shortDescription", "No description available."))
+
 
     # Transportation Options
     st.subheader("Transportation Options")
@@ -222,7 +213,7 @@ if 'generated' in st.session_state and st.session_state.generated and st.session
         with col_t4: st.metric("Public Transport", "Yes" if ways.get("byPublicTransport", False) else "No")
 
     # Guidelines
-    st.subheader("Practical Guidelines")
+    st.subheader("Guidelines")
     guidelines = output.get("guidelines", "No guidelines available.")
     st.write(guidelines)
 
@@ -232,10 +223,10 @@ if 'generated' in st.session_state and st.session_state.generated and st.session
     st.markdown(content, unsafe_allow_html=True)
 
     # Images
-    st.subheader("Generated Images")
+    st.subheader("Images")
     col_thumb, col_gallery = st.columns([1, 3])
     with col_thumb:
-        st.subheader("Featured Thumbnail")
+        st.subheader("Thumbnail")
         thumbnail = output.get("thumbnail", [])
         if thumbnail and len(thumbnail) > 0:
             try:
@@ -265,6 +256,15 @@ if 'generated' in st.session_state and st.session_state.generated and st.session
         else:
             st.info("No gallery images generated.")
 
+# Tags
+    st.subheader("Tags")
+    tags = output.get("tags", [])
+    if tags:
+        for tag in tags:
+            st.write(tag)
+    else:
+        st.write("No tags generated.")
+
     # Boolean Options
     st.subheader("Content Flags")
     flags = {
@@ -279,14 +279,6 @@ if 'generated' in st.session_state and st.session_state.generated and st.session
     }
     for key, value in flags.items():
         st.write(f"{key}: {'Yes' if value else 'No'}")
-
-    # Expanders for Heavy Outputs
-    with st.expander("Full JSON Output (Raw)", expanded=False):
-        st.json(output)
-
-    if st.session_state.formatted_json is not None:
-        with st.expander("Formatted MongoDB Output", expanded=False):
-            st.code(st.session_state.formatted_json, language="json")
 
     if hasattr(st.session_state, 'json_file') and st.session_state.json_file:
         st.info(f"Files saved locally:\n- JSON: {st.session_state.json_file}")
