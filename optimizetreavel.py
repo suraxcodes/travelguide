@@ -338,12 +338,12 @@ def create_location_validator_agent(model, current_date):
         system_message=f'''You are an expert location validator for INDIAN travel destinations as of {current_date}. 
 
 VALIDATION RULES:
-- ✅ CORRECT: Location name matches topic (e.g., topic "Colva Beach" = location "Colva Beach, Goa")
-- ✅ CORRECT: Location is in appropriate Indian state (Goa, Maharashtra, Karnataka, etc.)
-- ✅ CORRECT: Location type matches topic type (beach topic = coastal location, restaurant = urban area)
-- ❌ WRONG: Location name doesn't match topic (e.g., topic "Colva Beach" = location "Calangute Beach")
-- ❌ WRONG: Location is in wrong Indian state
-- ❌ WRONG: Location type mismatch (beach topic = inland location)
+-  CORRECT: Location name matches topic (e.g., topic "Colva Beach" = location "Colva Beach, Goa")
+-  CORRECT: Location is in appropriate Indian state (Goa, Maharashtra, Karnataka, etc.)
+-  CORRECT: Location type matches topic type (beach topic = coastal location, restaurant = urban area)
+-  WRONG: Location name doesn't match topic (e.g., topic "Colva Beach" = location "Calangute Beach")
+-  WRONG: Location is in wrong Indian state
+-  WRONG: Location type mismatch (beach topic = inland location)
 
 SPECIAL CASES:
 - For events: Location should match event location mentioned in topic
@@ -392,7 +392,7 @@ async def validate_existing_location_in_db(document, user_topic, content_type, m
                 "should_retry": validation_result.get("should_retry", False)
             }
     except Exception as e:
-        print(f"⚠️ Location validation error: {e}")
+        print(f" Location validation error: {e}")
     
     return {"is_valid": True, "needs_update": False, "reason": "Validation passed"}
 
@@ -403,16 +403,16 @@ async def fetch_and_validate_location(user_topic, search_query, content_type, mo
     validator_agent = create_location_validator_agent(model, current_date)
     
     for attempt in range(max_retries):
-        print(f"📍 Location fetch attempt {attempt + 1}/{max_retries} for '{user_topic}'")
+        print(f" Location fetch attempt {attempt + 1}/{max_retries} for '{user_topic}'")
         
         # Use the FIXED location fetch function
         location_data = fetch_location(search_query)
         
         # Check for errors
         if location_data.get("error"):
-            print(f"❌ Location fetch error: {location_data.get('error')}")
+            print(f" Location fetch error: {location_data.get('error')}")
             if attempt < max_retries - 1:
-                print("🔄 Retrying...")
+                print(" Retrying...")
                 time.sleep(2)  # Wait before retry
                 continue
             else:
@@ -420,7 +420,7 @@ async def fetch_and_validate_location(user_topic, search_query, content_type, mo
         
         # Skip validation if no address
         if not location_data.get("address"):
-            print("❌ No address in location data")
+            print(" No address in location data")
             if attempt < max_retries - 1:
                 continue
             else:
@@ -440,23 +440,23 @@ async def fetch_and_validate_location(user_topic, search_query, content_type, mo
             validation_result = await safe_run(validator_agent, validation_task)
             
             if isinstance(validation_result, dict) and validation_result.get("is_valid", False):
-                print(f"✅ Location validated: {validation_result.get('reason', 'Valid location')}")
+                print(f" Location validated: {validation_result.get('reason', 'Valid location')}")
                 return location_data
             else:
-                print(f"❌ Location invalid: {validation_result.get('reason', 'Unknown reason')}")
+                print(f" Location invalid: {validation_result.get('reason', 'Unknown reason')}")
                 
                 # If should retry and we have more attempts
                 if validation_result.get("should_retry", True) and attempt < max_retries - 1:
-                    print("🔄 Retrying with different search strategy...")
+                    print(" Retrying with different search strategy...")
                     # Modify search query for retry
                     search_query = modify_search_query_for_retry(user_topic, content_type, attempt)
                     continue
                 else:
-                    print("🚫 Max retries reached or no retry requested")
+                    print(" Max retries reached or no retry requested")
                     return location_data
                     
         except Exception as e:
-            print(f"⚠️ Validation error: {e}")
+            print(f"Validation error: {e}")
             if attempt < max_retries - 1:
                 continue
     
@@ -1495,17 +1495,17 @@ async def run_agent_original_with_validation(user_topic: str, more_details: str 
         max_tokens=500
     )
 
-    print("🤖 Classifying content type...")
+    print(" Classifying content type...")
     content_type_result = await safe_run(create_classifier_agent(model, current_date), f"Classify the type for topic: {user_topic}")
     content_type = content_type_result.get("type", "blog") if isinstance(content_type_result, dict) else "blog"
-    print(f"📝 Content type: {content_type}")
+    print(f" Content type: {content_type}")
 
-    print("📍 Deciding if location is needed...")
+    print(" Deciding if location is needed...")
     location_decision = await safe_run(create_smart_location_agent(model, current_date), f"Determine if location data should be fetched for topic: {user_topic}")
     should_fetch_location = location_decision.get("should_fetch", True)
     search_query = location_decision.get("search_query", user_topic).strip()
 
-    print(f"📍 Should fetch: {should_fetch_location} | Query: '{search_query}'")
+    print(f" Should fetch: {should_fetch_location} | Query: '{search_query}'")
 
     # THIS IS THE KEY: Use validated location fetch
     location_data = {"address": None, "latitude": 0.0, "longitude": 0.0}
@@ -1515,7 +1515,7 @@ async def run_agent_original_with_validation(user_topic: str, more_details: str 
             print("⚠️ Falling back to basic fetch...")
             location_data = fetch_location(f"{search_query}, Goa, India")  # Final fallback
     else:
-        print("ℹ️ Location not needed for this content type")
+        print("ℹ Location not needed for this content type")
 
     # Now run all other agents (same as before)
     (content_classifier_agent, smart_location_agent, description_agent, tags_agent, content_agent,
@@ -1603,7 +1603,7 @@ async def run_agent_original_with_validation(user_topic: str, more_details: str 
 # ===== FALLBACK CONTENT GENERATION FUNCTION =====
 async def generate_basic_fallback(user_topic: str, more_details: str, goa_db):
     """Simple backup content when main generator fails"""
-    print("🔄 Using fallback content generation...")
+    print("Using fallback content generation...")
     
     # Create basic content without any AI agents
     basic_content = {
@@ -1664,7 +1664,7 @@ async def generate_basic_fallback(user_topic: str, more_details: str, goa_db):
         
         return basic_content, None, None, filename_json, "blog", goa_db, formatted_json
     except Exception as e:
-        print(f"❌ Fallback generation error: {e}")
+        print(f"Fallback generation error: {e}")
         # Return minimal content as last resort
         return basic_content, None, None, None, "blog", goa_db, None
 
@@ -1679,7 +1679,7 @@ async def smart_content_generation(user_topic: str, more_details: str = None):
     existing_doc = get_document_by_topic(user_topic, goa_db)
     
     if existing_doc:
-        print(f"✅ Found existing content for: '{user_topic}'")
+        print(f" Found existing content for: '{user_topic}'")
         
         # Initialize agents for validation and updates
         (content_classifier_agent, smart_location_agent, description_agent, tags_agent, content_agent,
@@ -1698,8 +1698,8 @@ async def smart_content_generation(user_topic: str, more_details: str = None):
         
         # 1. Check and Update LOCATION if invalid
         if location_validation.get("needs_update", False):
-            print(f"📍 Existing location invalid: {location_validation.get('reason', 'Unknown reason')}")
-            print("🔄 Updating location...")
+            print(f" Existing location invalid: {location_validation.get('reason', 'Unknown reason')}")
+            print(" Updating location...")
             
             location_result = await safe_run(smart_location_agent, f"Determine if location data should be fetched for topic: {user_topic}")
             should_fetch_location = location_result.get("should_fetch", True)
@@ -1716,51 +1716,51 @@ async def smart_content_generation(user_topic: str, more_details: str = None):
                         "longitude": new_location.get("longitude", 0.0)
                     }
                     updates_made.append('location')
-                    print(f"✅ Location updated to: {new_location.get('address')}")
+                    print(f" Location updated to: {new_location.get('address')}")
                 else:
-                    print("❌ Failed to fetch valid location")
+                    print(" Failed to fetch valid location")
         
         # 2. Check and Update DESCRIPTION
         old_description = existing_doc.get('shortDescription', '')
         if needs_field_update(old_description, user_topic, created_at, is_content_field=False):
-            print("🔄 Updating description...")
+            print(" Updating description...")
             new_description = await safe_run(description_agent, f"Generate accurate description for {user_topic}")
             if new_description and new_description.strip():
                 updated_fields['shortDescription'] = new_description
                 updates_made.append('description')
-                print("✅ Description updated")
+                print("Description updated")
         
         # 3. Check and Update CONTENT
         old_content = existing_doc.get('text', '')
         if needs_field_update(old_content, user_topic, created_at, is_content_field=True):
-            print("🔄 Updating content...")
+            print(" Updating content...")
             content_type = existing_doc.get('postType', 'blog')
             new_content = await safe_run(content_agent, f"Generate accurate content for {content_type}: {user_topic}")
             if new_content and new_content.strip():
                 updated_fields['text'] = new_content
                 updates_made.append('content')
-                print("✅ Content updated")
+                print(" Content updated")
         
         # 4. Check and Update GUIDELINES
         old_guidelines = existing_doc.get('guidelines', '')
         if needs_field_update(old_guidelines, user_topic, created_at, is_content_field=False):
-            print("🔄 Updating guidelines...")
+            print(" Updating guidelines...")
             content_type = existing_doc.get('postType', 'blog')
             new_guidelines = await safe_run(guidelines_agent, f"Generate accurate guidelines for {content_type}: {user_topic}")
             if new_guidelines and new_guidelines.strip():
                 updated_fields['guidelines'] = new_guidelines
                 updates_made.append('guidelines')
-                print("✅ Guidelines updated")
+                print(" Guidelines updated")
         
         # Update the document if any fields were updated
         if updated_fields:
             slug = existing_doc.get('slug', user_topic.lower().replace(' ', '-'))
-            print(f"💾 Updating database for slug: {slug}")
+            print(f" Updating database for slug: {slug}")
             success = update_document_partial(goa_db, slug, updated_fields)
             if success:
-                print(f"✅ Database updated with: {', '.join(updates_made)}")
+                print(f" Database updated with: {', '.join(updates_made)}")
             else:
-                print("❌ Failed to update database")
+                print(" Failed to update database")
             
             # Refresh the document
             updated_doc = get_document_by_topic(user_topic, goa_db)
@@ -1768,19 +1768,19 @@ async def smart_content_generation(user_topic: str, more_details: str = None):
             
             return updated_doc, None, None, None, updated_doc.get('postType', 'blog'), goa_db, formatted_json
         else:
-            print("✅ No updates needed - returning existing content")
+            print("No updates needed - returning existing content")
             formatted_json = format_document(existing_doc)
             return existing_doc, None, None, None, existing_doc.get('postType', 'blog'), goa_db, formatted_json
     
     else:
         # No existing content - do full generation with validated location
-        print(f"🆕 No existing content found, generating new content for: '{user_topic}'")
+        print(f"No existing content found, generating new content for: '{user_topic}'")
         try:
             # Use enhanced version that validates location
             return await run_agent_original_with_validation(user_topic, more_details)
         except Exception as e:
-            print(f"❌ Generation failed: {e}")
-            print("🔄 Switching to fallback content generation...")
+            print(f" Generation failed: {e}")
+            print(" Switching to fallback content generation...")
             return await generate_basic_fallback(user_topic, more_details, goa_db)
                 
 # ===== MAIN FUNCTION (UPDATED) =====
@@ -1801,35 +1801,35 @@ def main():
             try:
                 user_topic = input().strip()
             except EOFError:
-                print("\n❌ Input failed - running in non-interactive mode. Use: python travel_content_generator.py 'topic' ['details']")
+                print("\n Input failed - running in non-interactive mode. Use: python travel_content_generator.py 'topic' ['details']")
                 return
             if not user_topic:
-                print("❌ No topic entered. Exiting.")
+                print(" No topic entered. Exiting.")
                 return
             print("🔹 Enter more about the topic (optional, press enter to skip): ", end="", flush=True)
             more_details = input().strip() or None
 
-        print(f"🔍 [Smart Mode] Processing: '{user_topic}'")
+        print(f" [Smart Mode] Processing: '{user_topic}'")
         output, saved_file, thumbnail_file, json_file, content_type, goa_db, formatted_json = asyncio.run(smart_content_generation(user_topic, more_details))
         
-        print(f"\n✅ Smart generation complete! Type: {content_type}")
+        print(f"\n Smart generation complete! Type: {content_type}")
         
         # Check if this was an update or new generation
         existing = get_document_by_topic(user_topic, goa_db)
         if existing:
-            print("📊 Content was RETURNED/IMPROVED from database")
+            print(" Content was RETURNED/IMPROVED from database")
         else:
-            print("🆕 Content was GENERATED as new")
+            print(" Content was GENERATED as new")
         
-        print("\n📦 Final Output:")
+        print("\n Final Output:")
         print(json.dumps(output, default=str, indent=2))
         
         if saved_file:
-            print(f"\n🖼 Main image: {saved_file}")
+            print(f"\n Main image: {saved_file}")
         if thumbnail_file:
-            print(f"📸 Thumbnail: {thumbnail_file}")
+            print(f" Thumbnail: {thumbnail_file}")
         if json_file:
-            print(f"📄 JSON file: {json_file}")
+            print(f"JSON file: {json_file}")
             
     except KeyboardInterrupt:
         print("\n❌ Operation cancelled by user")

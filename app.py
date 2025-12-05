@@ -8,7 +8,7 @@ import base64
 
 # Import the necessary functions and classes from the provided script
 from optimizetreavel import (
-    run_agent, get_mongodb_connection, insert_into_mongodb, get_document, format_document
+   smart_content_generation, get_mongodb_connection, get_document, format_document
 )
 
 # Streamlit App Configuration
@@ -22,246 +22,283 @@ st.set_page_config(
 st.sidebar.header("Quick Guide")
 st.sidebar.markdown("""
 - Enter a topic (e.g., "Colva Beach").
-- Add optional details for customization.
-- Click Generate to create content.
+- The system will check if content exists or create new.
 - Results include JSON, images, and MongoDB (if connected).
 
 Setup: Ensure API keys and dependencies (autogen, pymongo) are configured.
 """)
 
+# Custom CSS for map
+st.markdown("""
+<style>
+.map-container {
+    border-radius: 10px;
+    border: 2px solid #ddd;
+    margin: 10px 0;
+    overflow: hidden;
+}
+.map-responsive {
+    width: 100%;
+    height: 400px;
+    border: none;
+}
+.location-info {
+    background: #000000;
+    padding: 10px;
+    border-radius: 5px;
+    margin-bottom: 10px;
+    font-family: Arial, sans-serif;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # Main App
 st.title("Travel Content Generator")
 st.markdown("Ask about travel guides, event details, restaurant reviews, and more for Indian hotspots.")
 
-# Session state to manage form submission
-if 'generated' not in st.session_state:
-    st.session_state.generated = False
+# Integrated Search Section
+st.subheader("Search or Create Content")
 
-# Tabs for Generate vs. Search
-tab1, tab2 = st.tabs(["Generate New", "Search Existing"])
+# Create input section with single Search button
+col1, col2 = st.columns([3, 1])
+with col1:
+    topic = st.text_input(
+        "Enter topic",
+        placeholder="e.g., Colva Beach or Shigmo Utsav, Goa",
+        value="",
+        label_visibility="collapsed"
+    )
+with col2:
+    search_btn = st.button("Search", type="primary", use_container_width=True)
 
-with tab1:
-    # Input Fields
-    topic = st.text_input("Enter Topic", placeholder="e.g., Colva Beach or Shigmo Utsav, Goa", value="")
-    details = st.text_area("Additional Details (Optional)", placeholder="e.g., Focus on water sports", height=50)
+col3, col4 = st.columns([3, 1])
+with col3:
+    details = st.text_area(
+        "Additional Details (Optional)",
+        placeholder="e.g., Focus on water sports",
+        height=50,
+        label_visibility="collapsed"
+    )
+with col4:
+    if st.button("Clear", type="secondary", use_container_width=True):
+        # Clear session state
+        for key in ['generated', 'output', 'saved_file', 'thumbnail_file', 
+                   'json_file', 'content_type', 'goa_db', 'formatted_json']:
+            if key in st.session_state:
+                del st.session_state[key]
+        st.rerun()
 
-    if st.button("Generate Content", type="primary", use_container_width=True):
-        if not topic.strip():
-            st.error("Please enter a topic!")
-        else:
-            with st.spinner("Running AI agents... This may take 1-2 minutes."):
-                try:
-                    # Run the async function
-                    output, saved_file, thumbnail_file, json_file, content_type, goa_db, formatted_json = asyncio.run(
-                        run_agent(topic.strip(), details.strip() if details.strip() else None)
-                    )
+# Helper function to check if document exists
+def check_document_exists(topic, goa_db):
+    """Check if a document exists for the given topic"""
+    if goa_db is None:
+        return None
+    
+    try:
+        collection = goa_db["OUTPUT"]
+        
+        # Try to find by slug
+        slug = topic.lower().replace(' ', '-')
+        document = collection.find_one({"slug": slug})
+        
+        # If not found, try by title
+        if not document:
+            document = collection.find_one({"title": {"$regex": f"^{topic}$", "$options": "i"}})
+        
+        return document
+    except Exception:
+        return None
 
-                    # Store in session state
-                    st.session_state.generated = True
-                    st.session_state.output = output
-                    st.session_state.saved_file = saved_file
-                    st.session_state.thumbnail_file = thumbnail_file
-                    st.session_state.json_file = json_file
-                    st.session_state.content_type = content_type
-                    st.session_state.goa_db = goa_db
-                    st.session_state.formatted_json = formatted_json
+# Process Search button
+if search_btn and topic.strip():
+    with st.spinner("Searching and processing..."):
+        try:
+            # Use smart_content_generation which checks if content exists
+            output, saved_file, thumbnail_file, json_file, content_type, goa_db, formatted_json = asyncio.run(
+                smart_content_generation(topic.strip(), details.strip() if details.strip() else None)
+            )
 
-                    st.success(f"Content generated for '{topic}'! Type: {content_type}")
+            # Store in session state
+            st.session_state.generated = True
+            st.session_state.output = output
+            st.session_state.saved_file = saved_file
+            st.session_state.thumbnail_file = thumbnail_file
+            st.session_state.json_file = json_file
+            st.session_state.content_type = content_type
+            st.session_state.goa_db = goa_db
+            st.session_state.formatted_json = formatted_json
 
-                    # Display Key Outputs
-                    st.header("Generated Content Overview")
-
-                    # Short Description
-                    st.subheader("Short Description")
-                    st.write(st.session_state.output.get("shortDescription", "No description available."))
-
-                    # SEO Titles
-                    st.subheader("SEO Titles")
-                    seo_titles = st.session_state.output.get("seoTitle", [])
-                    if isinstance(seo_titles, list):
-                        for i, title in enumerate(seo_titles[:2], 1):
-                            st.write(f"{i}. {title}")
-                    else:
-                        st.write(seo_titles)
-
-                    # Tags
-                    st.subheader("SEO Tags")
-                    tags = st.session_state.output.get("tags", [])
-                    if tags:
-                        for tag in tags:
-                            st.write(tag)
-                    else:
-                        st.write("No tags generated.")
-
-                    # Location
-                    st.subheader("Location Details")
-                    location = st.session_state.output.get("location", {})
-                    if location.get("address"):
-                        st.write(f"Address: {location['address']}")
-                        st.write(f"Lat/Lng: {location.get('latitude', 0.0)}, {location.get('longitude', 0.0)}")
-                    else:
-                        st.write("No specific location data.")
-
-                    # Transportation Options
-                    st.subheader("Transportation Options")
-                    ways = st.session_state.output.get("ways", {})
-                    if isinstance(ways, dict):
-                        col_t1, col_t2, col_t3, col_t4 = st.columns(4)
-                        with col_t1: st.metric("Walking Only", "Yes" if ways.get("walkingOnly", False) else "No")
-                        with col_t2: st.metric("By Boat", "Yes" if ways.get("byBoat", False) else "No")
-                        with col_t3: st.metric("By Car", "Yes" if ways.get("byCar", False) else "No")
-                        with col_t4: st.metric("Public Transport", "Yes" if ways.get("byPublicTransport", False) else "No")
-
-                    # Guidelines
-                    st.subheader("Practical Guidelines")
-                    guidelines = st.session_state.output.get("guidelines", "No guidelines available.")
-                    st.write(guidelines)
-
-                    # Main Content
-                    st.subheader("Detailed Content")
-                    content = st.session_state.output.get("text", "<p>No content generated.</p>")
-                    st.markdown(content, unsafe_allow_html=True)
-
-                    # Images
-                    st.subheader("Generated Images")
-                    col_thumb, col_gallery = st.columns([1, 3])
-                    with col_thumb:
-                        st.subheader("Featured Thumbnail")
-                        thumbnail = st.session_state.output.get("thumbnail", [])
-                        if thumbnail and len(thumbnail) > 0:
-                            try:
-                                thumb_img = thumbnail[0]
-                                if isinstance(thumb_img, str) and (thumb_img.startswith('data:') or thumb_img.startswith('http')):
-                                    st.image(thumb_img, caption="Thumbnail", width=200)
-                                else:
-                                    st.warning("Thumbnail data invalid - skipping display.")
-                            except Exception as img_err:
-                                st.warning(f"Error displaying thumbnail: {str(img_err)}")
-                        else:
-                            st.info("No thumbnail generated.")
-                    with col_gallery:
-                        st.subheader("Gallery")
-                        gallery = st.session_state.output.get("gallery", [])
-                        if gallery:
-                            cols = st.columns(3)
-                            for i, img_data_url in enumerate(gallery[:3]):
-                                try:
-                                    if isinstance(img_data_url, str) and (img_data_url.startswith('data:') or img_data_url.startswith('http')):
-                                        with cols[i]:
-                                            st.image(img_data_url, caption=f"Gallery Image {i+1}", width=200)
-                                    else:
-                                        st.warning(f"Gallery image {i+1} data invalid - skipping.")
-                                except Exception as img_err:
-                                    st.warning(f"Error displaying gallery image {i+1}: {str(img_err)}")
-                        else:
-                            st.info("No gallery images generated.")
-
-                    # Boolean Options
-                    st.subheader("Content Flags")
-                    flags = {
-                        "Active": st.session_state.output.get("active", False),
-                        "Featured": st.session_state.output.get("featured", False),
-                        "Couple Friendly": st.session_state.output.get("coupleFriendly", False),
-                        "Group Friendly": st.session_state.output.get("groupFriendly", False),
-                        "Kids Friendly": st.session_state.output.get("kidsFriendly", False),
-                        "Trending": st.session_state.output.get("trending", False),
-                        "Monsoon Suitable": st.session_state.output.get("monsoon", False),
-                        "Open Now": st.session_state.output.get("isOpen", False)
-                    }
-                    for key, value in flags.items():
-                        st.write(f"{key}: {'Yes' if value else 'No'}")
-
-                    # Expanders for Heavy Outputs
-                    with st.expander("Full JSON Output (Raw)", expanded=False):
-                        st.json(st.session_state.output)
-
-                    if st.session_state.formatted_json is not None:
-                        with st.expander("Formatted MongoDB Output", expanded=False):
-                            st.code(st.session_state.formatted_json, language="json")
-
-                    st.info(f"Files saved locally:\n- JSON: {st.session_state.json_file}\n- Main Image: {st.session_state.saved_file}\n- Thumbnail: {st.session_state.thumbnail_file}")
-
-                    if st.session_state.goa_db is not None:
-                        st.info("Connected to MongoDB - Data inserted!")
-                    else:
-                        st.info("MongoDB not connected - Data saved to JSON only.")
-
-                except Exception as e:
-                    st.error(f"Error during generation: {str(e)}")
-                    st.exception(e)
-
-with tab2:
-    # Search Existing Content
-    st.subheader("Search Existing Content")
-    search_topic = st.text_input("Enter Topic/Slug to Search", placeholder="e.g., colva-beach or Colva Beach")
-
-    if st.button("Search", type="secondary", use_container_width=True) and search_topic.strip():
-        goa_db = get_mongodb_connection()
-        if goa_db is not None:
-            slug = search_topic.lower().replace(" ", "-")
-            doc = get_document(slug, goa_db)
-            if not doc:
-                from pymongo import MongoClient
-                client = MongoClient(goa_db.client.address)
-                collection = client['goa-app']['OUTPUT']
-                doc = collection.find_one({"title": {"$regex": search_topic, "$options": "i"}})
-
-            if doc:
-                st.success(f"Found: {doc.get('title', 'Unknown')}")
-
-                st.subheader("Retrieved Content")
-                st.subheader("Short Description")
-                st.write(doc.get("shortDescription", "No description."))
-
-                st.subheader("Detailed Content")
-                st.markdown(doc.get("text", "<p>No content.</p>"), unsafe_allow_html=True)
-
-                st.subheader("Images")
-                col_thumb, col_gallery = st.columns([1, 3])
-                with col_thumb:
-                    st.subheader("Featured Thumbnail")
-                    thumbnail = doc.get("thumbnail", [])
-                    if thumbnail and len(thumbnail) > 0:
-                        try:
-                            thumb_img = thumbnail[0]
-                            if isinstance(thumb_img, str) and (thumb_img.startswith('data:') or thumb_img.startswith('http')):
-                                st.image(thumb_img, caption="Thumbnail", width=200)
-                            else:
-                                st.warning("Thumbnail data invalid - skipping display.")
-                        except Exception as img_err:
-                            st.warning(f"Error displaying thumbnail: {str(img_err)}")
-                    else:
-                        st.info("No thumbnail available.")
-                with col_gallery:
-                    st.subheader("Gallery")
-                    gallery = doc.get("gallery", [])
-                    if gallery:
-                        cols = st.columns(3)
-                        for i, img_data_url in enumerate(gallery[:3]):
-                            try:
-                                if isinstance(img_data_url, str) and (img_data_url.startswith('data:') or img_data_url.startswith('http')):
-                                    with cols[i]:
-                                        st.image(img_data_url, caption=f"Gallery Image {i+1}", width=200)
-                                else:
-                                    st.warning(f"Gallery image {i+1} data invalid - skipping.")
-                            except Exception as img_err:
-                                st.warning(f"Error displaying gallery image {i+1}: {str(img_err)}")
-
-                st.subheader("Tags")
-                tags = doc.get("tags", [])
-                if tags:
-                    for tag in tags:
-                        st.write(tag)
-                else:
-                    st.write("No tags available.")
-
-                with st.expander("Full Retrieved JSON"):
-                    formatted = format_document(doc)
-                    st.code(formatted, language="json")
+            # Check if this was existing content or newly generated
+            existing_doc = check_document_exists(topic.strip(), goa_db)
+            
+            # Determine message based on whether content existed before
+            if existing_doc and existing_doc.get('_id'):
+                st.success(f" Found existing content for '{topic}'! Type: {content_type}")
             else:
-                st.warning("No matching content found. Try generating it!")
+                st.success(f"Generated new content for '{topic}'! Type: {content_type}")
+
+            # Refresh to show map
+            st.rerun()
+
+        except Exception as e:
+            st.error(f"Error during processing: {str(e)}")
+            st.exception(e)
+
+# Display map if content is available
+if 'generated' in st.session_state and st.session_state.generated and st.session_state.output:
+    output = st.session_state.output
+    
+    # Display dynamic map if location data is available
+    location = output.get("location", {})
+    if location and location.get("latitude") and location.get("longitude"):
+        st.subheader(" Location Map")
+        
+        # Create map HTML using OpenStreetMap
+        lat = float(location.get("latitude", 0))
+        lon = float(location.get("longitude", 0))
+        address = location.get("address", output.get("title", "Location"))
+        
+        map_html = f'''
+        <div class="map-container">
+            <div class="location-info">
+                <strong> {output.get("title", "Location")}</strong><br>
+                <small>{address}</small><br>
+                <small>Coordinates: {lat:.6f}, {lon:.6f}</small>
+            </div>
+            <iframe 
+                class="map-responsive"
+                src="https://www.openstreetmap.org/export/embed.html?bbox={lon-0.01}%2C{lat-0.01}%2C{lon+0.01}%2C{lat+0.01}&layer=mapnik&marker={lat}%2C{lon}"
+                scrolling="no">
+            </iframe>
+            <br/>
+            <small>
+                <a href="https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=15/{lat}/{lon}">View Larger Map</a>
+            </small>
+        </div>
+        '''
+        st.markdown(map_html, unsafe_allow_html=True)
+
+    # Display Key Outputs
+    st.header("Content Overview")
+
+    # Short Description
+    st.subheader("Short Description")
+    st.write(output.get("shortDescription", "No description available."))
+
+    # SEO Titles
+    st.subheader("SEO Titles")
+    seo_titles = output.get("seoTitle", [])
+    if isinstance(seo_titles, list):
+        for i, title in enumerate(seo_titles[:2], 1):
+            st.write(f"{i}. {title}")
+    else:
+        st.write(seo_titles)
+
+    # Tags
+    st.subheader("SEO Tags")
+    tags = output.get("tags", [])
+    if tags:
+        for tag in tags:
+            st.write(tag)
+    else:
+        st.write("No tags generated.")
+
+    # Location
+    st.subheader("Location Details")
+    if location.get("address"):
+        st.write(f"Address: {location['address']}")
+        st.write(f"Lat/Lng: {location.get('latitude', 0.0)}, {location.get('longitude', 0.0)}")
+    else:
+        st.write("No specific location data.")
+
+    # Transportation Options
+    st.subheader("Transportation Options")
+    ways = output.get("ways", {})
+    if isinstance(ways, dict):
+        col_t1, col_t2, col_t3, col_t4 = st.columns(4)
+        with col_t1: st.metric("Walking Only", "Yes" if ways.get("walkingOnly", False) else "No")
+        with col_t2: st.metric("By Boat", "Yes" if ways.get("byBoat", False) else "No")
+        with col_t3: st.metric("By Car", "Yes" if ways.get("byCar", False) else "No")
+        with col_t4: st.metric("Public Transport", "Yes" if ways.get("byPublicTransport", False) else "No")
+
+    # Guidelines
+    st.subheader("Practical Guidelines")
+    guidelines = output.get("guidelines", "No guidelines available.")
+    st.write(guidelines)
+
+    # Main Content
+    st.subheader("Detailed Content")
+    content = output.get("text", "<p>No content generated.</p>")
+    st.markdown(content, unsafe_allow_html=True)
+
+    # Images
+    st.subheader("Generated Images")
+    col_thumb, col_gallery = st.columns([1, 3])
+    with col_thumb:
+        st.subheader("Featured Thumbnail")
+        thumbnail = output.get("thumbnail", [])
+        if thumbnail and len(thumbnail) > 0:
+            try:
+                thumb_img = thumbnail[0]
+                if isinstance(thumb_img, str) and (thumb_img.startswith('data:') or thumb_img.startswith('http')):
+                    st.image(thumb_img, caption="Thumbnail", width=300)
+                else:
+                    st.warning("Thumbnail data invalid - skipping display.")
+            except Exception as img_err:
+                st.warning(f"Error displaying thumbnail: {str(img_err)}")
         else:
-            st.error("MongoDB not connected - can't search.")
+            st.info("No thumbnail generated.")
+    with col_gallery:
+        st.subheader("Gallery")
+        gallery = output.get("gallery", [])
+        if gallery:
+            cols = st.columns(1)
+            for i, img_data_url in enumerate(gallery[:1]):
+                try:
+                    if isinstance(img_data_url, str) and (img_data_url.startswith('data:') or img_data_url.startswith('http')):
+                        with cols[i]:
+                            st.image(img_data_url, caption=f"Gallery Image {i+1}", width=300)
+                    else:
+                        st.warning(f"Gallery image {i+1} data invalid - skipping.")
+                except Exception as img_err:
+                    st.warning(f"Error displaying gallery image {i+1}: {str(img_err)}")
+        else:
+            st.info("No gallery images generated.")
+
+    # Boolean Options
+    st.subheader("Content Flags")
+    flags = {
+        "Active": output.get("active", False),
+        "Featured": output.get("featured", False),
+        "Couple Friendly": output.get("coupleFriendly", False),
+        "Group Friendly": output.get("groupFriendly", False),
+        "Kids Friendly": output.get("kidsFriendly", False),
+        "Trending": output.get("trending", False),
+        "Monsoon Suitable": output.get("monsoon", False),
+        "Open Now": output.get("isOpen", False)
+    }
+    for key, value in flags.items():
+        st.write(f"{key}: {'Yes' if value else 'No'}")
+
+    # Expanders for Heavy Outputs
+    with st.expander("Full JSON Output (Raw)", expanded=False):
+        st.json(output)
+
+    if st.session_state.formatted_json is not None:
+        with st.expander("Formatted MongoDB Output", expanded=False):
+            st.code(st.session_state.formatted_json, language="json")
+
+    if hasattr(st.session_state, 'json_file') and st.session_state.json_file:
+        st.info(f"Files saved locally:\n- JSON: {st.session_state.json_file}")
+        if hasattr(st.session_state, 'saved_file') and st.session_state.saved_file:
+            st.write(f"- Main Image: {st.session_state.saved_file}")
+        if hasattr(st.session_state, 'thumbnail_file') and st.session_state.thumbnail_file:
+            st.write(f"- Thumbnail: {st.session_state.thumbnail_file}")
+
+    if st.session_state.goa_db is not None:
+        st.info("Connected to MongoDB - Data saved!")
+    else:
+        st.info("MongoDB not connected - Data saved to JSON only.")
 
 # Footer
 st.markdown("---")
