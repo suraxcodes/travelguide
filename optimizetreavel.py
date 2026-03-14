@@ -5,24 +5,102 @@ import base64
 import requests
 import argparse
 import time
+import urllib.parse
+import streamlit as st
 from io import BytesIO
 from PIL import Image
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Any, List, Tuple
 from pymongo import MongoClient
 from bson import ObjectId
 from collections import OrderedDict
 from autogen_agentchat.agents import AssistantAgent 
 from autogen_agentchat.teams import MagenticOneGroupChat
 from autogen_ext.models.openai import OpenAIChatCompletionClient
+from pymongo.mongo_client import MongoClient
+from pymongo.server_api import ServerApi
+
+# ===== LLM BACKEND CONFIGURATION =====
+# Set USE_OLLAMA = True to use a local LLM via Ollama
+# Set USE_OLLAMA = False to use OpenRouter API (External)
+USE_OLLAMA = False 
+OLLAMA_MODEL = "deepseek-r1:7b" # Example: llama3, mistral, phi3, etc.
+OLLAMA_URL = "http://localhost:11434/v1"
+
+# NOTE: To switch to external API, set USE_OLLAMA = False or comment out the Ollama block in get_llm_client()
+
+
+def get_llm_client():
+    """Returns the configured Autogen-compatible LLM client."""
+    if USE_OLLAMA:
+        print(f" [LLM] Using Local Ollama ({OLLAMA_MODEL})")
+        return OpenAIChatCompletionClient(
+            model=OLLAMA_MODEL,
+            base_url=OLLAMA_URL,
+            api_key="ollama", # Placeholder for local use
+            max_tokens=500, # Increased for better generation
+        )
+    else:
+        openrouter_key = get_openrouter_key()
+        if not openrouter_key:
+            raise RuntimeError("No OpenRouter API key found. Set OPENROUTER_KEY in ENV, st.secrets, or create api.txt.")
+        
+        
+        model_id = os.getenv("OPENROUTER_MODEL", "gpt-4o-mini")
+        print(f" [LLM] Using OpenRouter ({model_id})")
+        
+        default_headers = {
+            "HTTP-Referer": os.getenv("APP_URL", "http://localhost"),
+            "X-Title": os.getenv("APP_NAME", "AI_travel_Guide_Agents"),
+        }
+        
+        return OpenAIChatCompletionClient(
+            model=model_id,
+            api_key=openrouter_key,
+            base_url="https://openrouter.ai/api/v1",
+            max_tokens=1000, # Higher for full content generation
+            default_headers=default_headers,
+            include_name_in_message=False
+        )
+
+
+# Set UTF-8 encoding for Windows console to handle emojis
 
 CACHE_FILE = Path("location_cache.json")
 if CACHE_FILE.exists():
     with open(CACHE_FILE, "r", encoding="utf-8") as f:
-        LOCATION_CACHE = json.load(f)
+        LOCATION_CACHE: dict = json.load(f)
 else:
-    LOCATION_CACHE = {}
+    LOCATION_CACHE: dict = {}
+
+def get_openrouter_key() -> str:
+    """Get OpenRouter API key from ENV, Streamlit Secrets, or local api.txt"""
+    # 1. Check Environment Variable
+    key = os.getenv("OPENROUTER_KEY")
+    if key:
+        return key
+    
+    # 2. Check Streamlit Secrets (for deployment)
+    try:
+        if "MY_API_KEY" in st.secrets:
+            return st.secrets["MY_API_KEY"]
+        if "OPENROUTER_KEY" in st.secrets:
+            return st.secrets["OPENROUTER_KEY"]
+    except (ImportError, Exception):
+        pass
+
+    # 3. Check Local api.txt
+    candidates = [
+        Path(__file__).resolve().parent / "api.txt",
+        Path(__file__).resolve().parents[1] / "api.txt",
+        Path("api.txt"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return p.read_text(encoding="utf-8").strip()
+            
+    return ""
 
 def save_cache():
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
@@ -70,8 +148,13 @@ def generate_dynamic_map(location_name, lat=None, lon=None):
 
 def fetch_location_for_map(location_name):
     """
-    Fetch location data from Nominatim specifically for map generation
+    Fetch location data from Nominatim specifically for map generation with caching
     """
+    key = location_name.strip()
+    cached = LOCATION_CACHE.get(key)
+    if cached and "latitude" in cached and "longitude" in cached:
+        return cached
+
     url = "https://nominatim.openstreetmap.org/search"
     
     # Prioritize Indian locations
@@ -98,12 +181,16 @@ def fetch_location_for_map(location_name):
             
             if data:
                 location = data[0]
-                return {
+                result = {
                     "address": location.get("display_name", location_name),
                     "latitude": float(location["lat"]),
                     "longitude": float(location["lon"])
                 }
-        except Exception as e:
+                if isinstance(LOCATION_CACHE, dict):
+                    LOCATION_CACHE[key] = result
+                save_cache()
+                return result
+        except Exception:
             continue
     
     return {"error": "Location not found", "address": location_name}
@@ -156,7 +243,7 @@ def create_osm_map_html(lat, lon, location_name, address):
             
             // Add OpenStreetMap tiles
             L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
-                attribution: 'Â© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
                 maxZoom: 18
             }}).addTo(map);
             
@@ -289,13 +376,33 @@ def convert_image_to_webp_and_encode_base64(image: Image.Image, target_width=800
 
 # MongoDB Connection
 def get_mongodb_connection():
-    """Establish MongoDB connections for goa-app database"""
+    """Establish MongoDB connection for goa-app database using MONGODB_URI env var or mongo_uri.txt."""
     try:
-        mongo_uri = os.getenv("mongodb+srv://nomorevenxm_db_user:<db_password>@cluster0.l3nhk4f.mongodb.net/?appName=Cluster0")
+        # Priority: Env Var > Hardcoded fallback > Files
+        mongo_uri = st.secrets["MONGODB_URI"]
+        
+        # If no env var, try to get from hardcoded string (fixing previous bug)
+        if not mongo_uri:
+            # This looks like what was intended: a template to fill
+            # or a hardcoded string that was accidentally put in getenv
+            hardcoded_uri = "mongodb+srv://nomorevenxm_db_user:travelagent@cluster0.l3nhk4f.mongodb.net/?appName=Cluster0"
+            if "<db_password>" not in hardcoded_uri:
+                mongo_uri = hardcoded_uri
+        
+        if not mongo_uri:
+            candidates = [
+                Path(__file__).resolve().parent / "mongo_uri.txt",
+                Path(__file__).resolve().parents[1] / "mongo_uri.txt",
+            ]
+            for p in candidates:
+                if p.exists():
+                    mongo_uri = p.read_text(encoding="utf-8").strip()
+                    break
+        if not mongo_uri:
+            return None
         client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
         client.admin.command('ping')
-        goa_db = client['goa-app']
-        return goa_db
+        return client['goa-app']
     except Exception:
         return None
 
@@ -326,14 +433,15 @@ def insert_into_mongodb(output, goa_db):
             )
         else:
             collection.insert_one(output)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"MongoDB insert/update error: {e}")
 
 # ===== LOCATION VALIDATION SYSTEM =====
 def create_location_validator_agent(model, current_date):
     """Agent that validates if fetched location matches the topic"""
     return AssistantAgent(
-        name="location_validator_agent",
+        "location_validator_agent",
+        model,
         description="Validates if location data matches the topic correctly",
         system_message=f'''You are an expert location validator for INDIAN travel destinations as of {current_date}. 
 
@@ -352,11 +460,10 @@ SPECIAL CASES:
 
 Respond ONLY with JSON in this exact format:
 {{"is_valid": true|false, "reason": "brief explanation", "should_retry": true|false}}
-''',
-        model_client=model
+'''
     )
 
-async def validate_existing_location_in_db(document, user_topic, content_type, model):
+async def validate_existing_location_in_db(document: Dict[str, Any], user_topic: str, content_type: str, model: Any) -> Dict[str, Any]:
     """
     Validate if the existing location in database is correct for the topic
     """
@@ -396,7 +503,7 @@ async def validate_existing_location_in_db(document, user_topic, content_type, m
     
     return {"is_valid": True, "needs_update": False, "reason": "Validation passed"}
 
-async def fetch_and_validate_location(user_topic, search_query, content_type, model, max_retries=3):
+async def fetch_and_validate_location(user_topic: str, search_query: str, content_type: str, model: Any, max_retries: int = 3) -> Dict[str, Any]:
     """Fetch location with validation and retries"""
     current_date = datetime.now().strftime("%B %d, %Y")
     
@@ -416,7 +523,7 @@ async def fetch_and_validate_location(user_topic, search_query, content_type, mo
                 time.sleep(2)  # Wait before retry
                 continue
             else:
-                return location_data
+                return location_data or {"error": "Location not found"}
         
         # Skip validation if no address
         if not location_data.get("address"):
@@ -424,7 +531,7 @@ async def fetch_and_validate_location(user_topic, search_query, content_type, mo
             if attempt < max_retries - 1:
                 continue
             else:
-                return location_data
+                return location_data or {"error": "No address recorded"}
         
         # Validate the location
         validation_task = f'''
@@ -441,7 +548,7 @@ async def fetch_and_validate_location(user_topic, search_query, content_type, mo
             
             if isinstance(validation_result, dict) and validation_result.get("is_valid", False):
                 print(f" Location validated: {validation_result.get('reason', 'Valid location')}")
-                return location_data
+                return location_data or {}
             else:
                 print(f" Location invalid: {validation_result.get('reason', 'Unknown reason')}")
                 
@@ -453,14 +560,14 @@ async def fetch_and_validate_location(user_topic, search_query, content_type, mo
                     continue
                 else:
                     print(" Max retries reached or no retry requested")
-                    return location_data
+                    return location_data or {}
                     
         except Exception as e:
             print(f"Validation error: {e}")
             if attempt < max_retries - 1:
                 continue
     
-    return location_data
+    return location_data or {}
 
 def modify_search_query_for_retry(user_topic, content_type, attempt):
     """Modify search query for retry attempts"""
@@ -541,11 +648,11 @@ def get_document(slug, goa_db):
     return document
 
 # Format document as JSON with specific field order
-def format_document(document):
+def format_document(document: Optional[Dict[str, Any]]) -> Optional[str]:
     """Format a MongoDB document to JSON with specific field order."""
     if not document:
         return None
-    ordered_doc = OrderedDict([
+    ordered_doc: Dict[str, Any] = OrderedDict([
         ("_id", str(document.get("_id"))),
         ("gallery", document.get("gallery", [])),
         ("tags", document.get("tags", [])),
@@ -566,7 +673,7 @@ def format_document(document):
         ("city", str(document.get("city")) if document.get("city") else None),
         ("author", str(document.get("author")) if document.get("author") else None),
         ("thumbnail", document.get("thumbnail", "")),
-        ("createdAt", document.get("createdAt").isoformat() if document.get("createdAt") else ""),
+        ("createdAt", document["createdAt"].isoformat() if document.get("createdAt") and hasattr(document["createdAt"], "isoformat") else ""),
         ("rating", str(document.get("rating")) if document.get("rating") else None),
         ("likes", str(document.get("likes")) if document.get("likes") else None),
         ("views", str(document.get("views")) if document.get("views") else None),
@@ -640,6 +747,7 @@ def fetch_location_precise(query: str):
         r = requests.get(
             "https://nominatim.openstreetmap.org/search",
             params=params,
+            headers={"User-Agent": "TravelGuideBot/1.0 (contact@travelguide.com)"},
             timeout=15
         )
         if r.status_code != 200 or not r.json():
@@ -681,7 +789,12 @@ def verify_by_reverse_geocode(lat: float, lon: float, expected_words: list) -> b
     time.sleep(1.1)
     try:
         params = {"lat": lat, "lon": lon, "format": "json", "zoom": 16}
-        r = requests.get("https://nominatim.openstreetmap.org/reverse", params=params,timeout=10)
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params=params,
+            headers={"User-Agent": "TravelGuideBot/1.0 (contact@travelguide.com)"},
+            timeout=10
+        )
         if r.status_code == 200:
             data = r.json()
             reverse_name = data.get("display_name", "").lower()
@@ -691,9 +804,13 @@ def verify_by_reverse_geocode(lat: float, lon: float, expected_words: list) -> b
     return False
 
 def fetch_location(address: str):
-    """Enhanced location lookup that prioritizes Indian locations"""
+    """Enhanced location lookup that prioritizes Indian locations with caching"""
     if not address:
         return {"address": None, "latitude": 0.0, "longitude": 0.0}
+    key = address.strip()
+    cached = LOCATION_CACHE.get(key)
+    if cached and "latitude" in cached and "longitude" in cached:
+        return cached
     url = "https://nominatim.openstreetmap.org/search"
     search_strategies = [
         f"{address}, India",
@@ -716,28 +833,36 @@ def fetch_location(address: str):
     unique_strategies = list(dict.fromkeys(search_strategies))
     best_indian_result = None
     for search_query in unique_strategies:
+        time.sleep(1.1)
         params = {
             "q": search_query,
             "format": "json",
             "limit": 5,
             "addressdetails": 1,
-            "_": str(int(datetime.now().timestamp()))  # Cache busting
+            "_": str(int(datetime.now().timestamp()))
         }
         try:
-            response = requests.get(url, params=params, headers={
-                "User-Agent": "TravelGuideBot/1.0 (contact@travelguide.com)"
-            })
+            response = requests.get(
+                url,
+                params=params,
+                headers={"User-Agent": "TravelGuideBot/1.0 (contact@travelguide.com)"},
+                timeout=10
+            )
             response.raise_for_status()
             data = response.json()
             if data:
                 indian_results = [loc for loc in data if 'india' in loc.get('display_name', '').lower() or loc.get('address', {}).get('country_code', '').lower() == 'in']
                 if indian_results:
                     location_data = indian_results[0]
-                    return {
+                    result = {
                         "address": location_data.get("display_name", address),
                         "latitude": float(location_data["lat"]),
                         "longitude": float(location_data["lon"])
                     }
+                    if isinstance(LOCATION_CACHE, dict):
+                        LOCATION_CACHE[key] = result
+                    save_cache()
+                    return result
                 elif not best_indian_result:
                     location_data = data[0]
                     best_indian_result = {
@@ -748,6 +873,9 @@ def fetch_location(address: str):
         except Exception:
             continue
     if best_indian_result:
+        if isinstance(LOCATION_CACHE, dict):
+            LOCATION_CACHE[key] = best_indian_result
+        save_cache()
         return best_indian_result
     return {"error": "Location not found", "address": address}
 
@@ -780,7 +908,8 @@ def get_category_id(goa_db, category_name):
 def create_smart_location_agent(model, current_date):
     """Agent that determines if a location should be fetched"""
     return AssistantAgent(
-        name="smart_location_agent",
+        "smart_location_agent",
+        model,
         description="Determines if location data should be fetched and what to search for",
         system_message=f'''You are an expert location analyzer for INDIAN travel destinations as of {current_date}. Analyze the topic and determine:
 1. Should we fetch location data?
@@ -806,20 +935,21 @@ IMPORTANT: This is for INDIAN travel guide, so we want Indian locations only.
 Respond ONLY with JSON in this exact format:
 {{"should_fetch": true|false, "search_query": "exact query to use"}}
 If should_fetch is false, search_query should be an empty string.
-''',
-        model_client=model
+'''
     )
 
 # Create classifier agent
 def create_classifier_agent(model, current_date):
     """Agent that categorizes topics into multiple content types"""
     return AssistantAgent(
-        name="content_classifier_agent",
+        "content_classifier_agent",
+        model,
         description="Categorizes topics into appropriate content types",
         system_message=f'''You are an expert content classifier as of {current_date}. Analyze the given topic and determine its type:
 
 Available categories:
-- 'event': Festivals, concerts, shows, parties, temporary activities
+- 'event': Festivals, cultural celebrations (e.g., Shigmo, Carnival, Sangod), concerts, shows
+- 'culture': Traditional folk dances, rituals, local traditions, historical customs
 - 'restaurant': Specific eating establishments with proper names (e.g., 'McDonald's', 'Joe's Pizza')
 - 'blog': General topics, food items (like 'momos', 'pizza'), travel tips, guides, informational content
 - 'beach': Beaches, coastal destinations
@@ -848,28 +978,18 @@ IMPORTANT RULES:
 Respond ONLY with JSON in this exact format:
 {{"type": "beach|waterfall|fort|religion|travel|event|restaurant|blog|water-sport|boat-party|guide-tour|dining-fine|dining-casual|dining-family|dining-seafood|dining-bar|dining-chinese|entertainment", "confidence": 0.95}}
 ''',
-        model_client=model
     )
 
 # Team configuration
 def teamConfig():
     current_date = datetime.now().strftime("%B %d, %Y")
-    openrouter_key = os.getenv("OPENROUTER_KEY")
-    if not openrouter_key:
-        if os.path.exists("api.txt"):
-            openrouter_key = open("api.txt").read().strip()
-        else:
-            raise RuntimeError("No OpenRouter API key found. Set OPENROUTER_KEY or create api.txt.")
-    model = OpenAIChatCompletionClient(
-        model="gpt-4o-mini",
-        api_key=openrouter_key,
-        base_url="https://openrouter.ai/api/v1",
-        max_tokens=500
-    )
+    model = get_llm_client()
+
     content_classifier_agent = create_classifier_agent(model, current_date)
     smart_location_agent = create_smart_location_agent(model, current_date)
     description_agent = AssistantAgent(
-        name="description_agent",
+        "description_agent",
+        model,
         description="Writes type-specific descriptions",
         system_message=f'''You are an expert content writer specializing in travel and tourism as of {current_date}. 
 Write a short, engaging description (1-2 sentences) based on the content type:
@@ -879,11 +999,11 @@ Write a short, engaging description (1-2 sentences) based on the content type:
 - For BLOGS (blog): Create informative, engaging overviews
 - For ACTIVITIES (water-sport, guide-tour, travel): Highlight activities, experiences, and key features
 Respond ONLY with plain text.
-''',
-        model_client=model
+'''
     )
     tags_agent = AssistantAgent(
-        name="tags_agent",
+        "tags_agent",
+        model,
         description="Generates topic-specific SEO tags with hashtags",
         system_message=f'''You are an SEO expert as of {current_date}. Generate 8-12 highly relevant tags with hashtags based ONLY on the exact topic.
 
@@ -904,11 +1024,11 @@ Respond ONLY with plain text.
     - For 'Italian Restaurant': {{"tags": ["#ItalianRestaurant", "#Pasta", "#Pizza", "#ItalianCuisine", "#FineDining", "#ItalianFood", "#RestaurantReview", "#Foodie"]}}
 
     ALWAYS return valid JSON: {{"tags": ["#tag1", "#tag2", ...]}}
-    ''',
-        model_client=model
+    '''
     )
     content_agent = AssistantAgent(
-        name="content_agent",
+        "content_agent",
+        model,
         description="Writes detailed, type-specific long-form HTML content",
         system_message=f'''You are an expert travel and lifestyle content writer as of October 01, 2025. Your goal is to generate long, detailed, and engaging HTML content for the given topic, ensuring all sections and paragraphs are complete without truncation or mid-sentence breaks. The output must include at least 5 full paragraphs, each with 4-5 sentences, and the final paragraph must be fully concluded with no abrupt endings. Use <p>, <ul>, <ol>, <li>, <strong>, <em>, <h2>, and <h3> tags for proper formatting. Do NOT include <html>, <head>, or <body> tags.
 
@@ -936,11 +1056,11 @@ Respond ONLY with plain text.
     - For seasonal topics, specify the best times to visit or participate, tied to October 01, 2025.
 
     By adhering to these rules, produce polished, complete, and engaging HTML content that avoids truncation and provides a seamless, professional reading experience.
-    ''',
-        model_client=model
+    '''
     )
     guidelines_agent = AssistantAgent(
-        name="guidelines_agent",
+        "guidelines_agent",
+        model,
         description="Provides type-specific guidelines",
         system_message=f'''You are a travel and safety expert as of {current_date}. Provide 4-6 practical guidelines based on type, considering current date for timeliness:
 - PLACES (beach, waterfall, fort, religion): Travel tips, safety, local customs
@@ -949,56 +1069,32 @@ Respond ONLY with plain text.
 - BLOGS (blog): General travel advice and tips
 - ACTIVITIES (water-sport, guide-tour, travel): Safety tips, equipment, preparation
 Plain text only, no formatting.
-''',
-        model_client=model
+'''
     )
     image_prompt_agent = AssistantAgent(
-        name="image_prompt_agent",
-        description="Creates highly detailed and topic-specific image generation prompts",
-        system_message=f'''You are an expert AI image prompt writer specialized in creating detailed and highly relevant prompts for generating high-quality, photorealistic images as of {current_date}.
-
-Generate a detailed image prompt (60-80 words) that vividly describes the core subject of the user topic with precise context.
-
-- For PLACES (beach, waterfall, fort, religion): Describe scenic views, architecture, landscapes, atmosphere, time of day, and important landmarks.
-- For EVENTS (event, boat-party, entertainment): Describe the crowd, stage, decorations, activities, energy, and atmosphere.
-- For RESTAURANTS (restaurant, dining-fine, dining-casual, dining-family, dining-seafood, dining-bar, dining-chinese): Describe the interior, food presentation, ambiance, architecture, people dining, or outdoor seating.
-- For BLOGS (blog): Create a conceptual, informative image focusing purely on the topic in an illustrative or infographic style.
-- For ACTIVITIES (water-sport, guide-tour, travel): Describe the activity, setting, equipment, and participants.
-
-Ensure the prompt is focused only on the exact topic without generic elements, with a photorealistic style.
-
-Examples:
-- For 'Colva Beach': 'Photorealistic image of Colva Beach at sunset, golden sands, calm waves, palm trees, serene atmosphere, high-resolution.'
-- For 'Sunburn Festival': 'Large crowd at Sunburn Festival with colorful stage lights, people dancing, energetic atmosphere, professional photography style.'
-- For 'Joe's Pizza NYC': 'Cozy interior of Joe's Pizza, wooden tables, delicious pizza slices, warm lighting, photorealistic.'
-
-Always return a coherent, descriptive prompt as plain text without quotes or extra formatting
-''',
-        model_client=model
+        "image_prompt_agent",
+        model,
+        description="Creates topic-specific image generation prompts",
+        system_message=f'''You are an expert AI image prompt writer specialized in creating descriptive prompts for travel images as of {current_date}.
+Generate a vivid, photorealistic image prompt about the user's provided topic. 
+CRITICAL: The prompt must explicitly include the main name of the place, attraction, or topic.
+Focus on the core subject, lighting, and atmosphere to ensure the image is highly relevant.
+Respond ONLY with the actual prompt text, no quotes or intro.'''
     )
     thumbnail_prompt_agent = AssistantAgent(
-        name="thumbnail_prompt_agent",
-        description="Creates highly precise thumbnail-specific image prompts",
-        system_message=f'''You are an expert at creating prompts for eye-catching thumbnail images designed to attract clicks as of {current_date}.
-
-Generate a concise, focused prompt (20-30 words) for a square thumbnail image that directly represents the user topic in a highly relevant and specific way.
-
-- Focus only on the core subject (event, place, restaurant, blog, activity).
-- Avoid generic or unrelated concepts.
-- Use vibrant colors, professional photography style, and clearly describe the subject.
-
-Examples:
-- For 'Colva Beach': 'Vibrant photo of Colva Beach, golden sands, calm waves, palm trees, high resolution.'
-- For 'Sunburn Festival': 'Crowd at Sunburn Festival with colorful stage lights, energetic atmosphere, photorealistic.'
-- For 'Joe's Pizza, NYC': 'Joe's Pizza storefront, neon sign, delicious pizza displayed, high-quality photography.'
-
-Always return a single coherent sentence as plain text without quotes or extra formatting
-''',
-        model_client=model
+        "thumbnail_prompt_agent",
+        model,
+        description="Creates short thumbnail image prompts",
+        system_message=f'''You are an expert at creating concise prompts for travel thumbnails as of {current_date}.
+Generate a short, focused prompt for a square thumbnail representing the provided topic.
+The thumbnail should be instantly recognizable and highly specific to the topic.
+Respond ONLY with the actual prompt text, no quotes or intro.'''
     )
+
     
     seo_title_agent = AssistantAgent(
-            name="seo_title_agent",
+            "seo_title_agent",
+            model,
             description="Generates polished, SEO-optimized titles with proper grammar",
             system_message=f'''You are an SEO and content critic as of {current_date}. 
     Your job is to create two alternative titles for the given topic and content type. 
@@ -1022,12 +1118,12 @@ Always return a single coherent sentence as plain text without quotes or extra f
 
     ### OUTPUT FORMAT ###
     Return exactly 2 lines of plain text, each line being one polished SEO title.
-    ''',
-            model_client=model
+    '''
         )
 
     transportation_options_agent = AssistantAgent(
-        name="transportation_options_agent",
+        "transportation_options_agent",
+        model,
         description="Determines transportation options based on location",
         system_message=f'''You are an expert in travel logistics for Indian destinations as of {current_date}. 
 Based on the provided topic, content type, and location data, determine the following transportation options:
@@ -1039,38 +1135,39 @@ Based on the provided topic, content type, and location data, determine the foll
 Consider the location's characteristics (e.g., urban, rural, coastal, remote) and typical accessibility for Indian destinations.
 Return ONLY a JSON object in this format:
 {{"walkingOnly": true|false, "byBoat": true|false, "byCar": true|false, "byPublicTransport": true|false}}
-''',
-        model_client=model
+'''
     )
     return (content_classifier_agent, smart_location_agent, description_agent, tags_agent, content_agent,
             guidelines_agent, image_prompt_agent, thumbnail_prompt_agent, seo_title_agent,
             transportation_options_agent), model
 
 # Safe run agent with retries
-async def safe_run(agent, task, retries=2):
+async def safe_run(agent: Any, task: str, retries: int = 2) -> Any:
     """Safely runs an agent with retries and returns its output""" 
     for attempt in range(retries):
         try:
-            result = await agent.run(task=task)
+            # Add a 60-second timeout to agent runs to prevent hangs
+            result = await asyncio.wait_for(agent.run(task=task), timeout=60)
             if result:
                 if isinstance(result, dict):
                     return result
-                if hasattr(result, "messages") and result.messages and result.messages[-1].content.strip():
-                    content = result.messages[-1].content.strip()
+                if hasattr(result, "messages") and getattr(result, "messages") and getattr(result, "messages")[-1].content.strip():
+                    content = getattr(result, "messages")[-1].content.strip()
                     if content.startswith('{') and content.endswith('}'):
                         try:
                             return json.loads(content)
                         except:
                             pass
                     return content
-        except Exception:
+        except Exception as e:
+            print(f"Agent {agent.name} failed attempt {attempt+1}: {e}")
             continue
     if agent.name == "smart_location_agent":
         return {"should_fetch": False, "search_query": ""}
     return ""
 
 # Get boolean options
-async def get_boolean_options(content_type, user_topic, model):
+async def get_boolean_options(content_type: str, user_topic: str, model: Any) -> Dict[str, Any]:
     """Determine boolean options for the content""" 
     current_date = datetime.now().strftime("%B %d, %Y")
     options = {
@@ -1092,7 +1189,8 @@ async def get_boolean_options(content_type, user_topic, model):
     }
     if content_type in ["beach", "waterfall", "fort", "religion", "event", "restaurant", "boat-party", "guide-tour", "dining-fine", "dining-casual", "dining-family", "dining-seafood", "dining-bar", "dining-chinese", "entertainment"]:
         boolean_agent = AssistantAgent(
-            name="boolean_options_agent",
+            "boolean_options_agent",
+            model,
             description="Determines specific boolean options for content",
             system_message=f'''You are an expert in travel and tourism content configuration as of {current_date}. 
 For the given topic and content type, determine the following boolean options:
@@ -1106,8 +1204,7 @@ Content Type: {content_type}
 
 Return ONLY a JSON object in this format:
 {{"coupleFriendly": true|false, "groupFriendly": true|false, "isOpen": true|false, "kidsFriendly": true|false}}
-''',
-            model_client=model
+'''
         )
         agent_result = await safe_run(boolean_agent, f"Determine boolean options for {content_type}: {user_topic}")
         if isinstance(agent_result, dict):
@@ -1119,24 +1216,80 @@ Return ONLY a JSON object in this format:
             })
     return options
 
-# Generate images
-def generate_image_pollinations(prompt, filename, width=1024, height=1024, seed=None, model="flux"):
+import random
+import re
+
+def generate_image_pollinations(prompt, filename, width=1024, height=1024, seed=None, model="flux", content_type=None):
+    """
+    Generate an image using Pollinations AI with robust error handling and fallback models.
+    """
     try:
+        if not prompt or not prompt.strip() or str(prompt) == "None":
+            return "", ""
+            
         if seed is None:
-            seed = int(datetime.now().timestamp() % 1000)
+            seed = int(time.time() * 1000) % 1000000 + random.randint(1, 1000)
+            
+        # Strip <think> blocks if using DeepSeek-type models
+        prompt_str = str(prompt)
+        prompt_str = re.sub(r'<think>.*?</think>', '', prompt_str, flags=re.DOTALL | re.IGNORECASE).strip()
+        
+        # Add high-quality keywords for better results
+        if "photorealistic" not in prompt_str.lower():
+            prompt_str += ", photorealistic, cinematic lighting, 8k resolution, highly detailed"
+            
         import urllib.parse
-        encoded_prompt = urllib.parse.quote(prompt)
-        image_url = f"https://pollinations.ai/p/{encoded_prompt}?width={width}&height={height}&seed={seed}&model={model}"
-        response = requests.get(image_url, timeout=30)
-        response.raise_for_status()
-        img = Image.open(BytesIO(response.content))
-        if img.height > 50:
-            img = img.crop((0, 0, img.width, img.height - 50))
-        data_url = convert_image_to_webp_and_encode_base64(img, target_width=800, target_height=600)
-        img.save(filename.replace(".png", ".webp"), format="WEBP", quality=80)
-        return data_url, filename.replace(".png", ".webp")
-    except Exception:
+        encoded_prompt = urllib.parse.quote(prompt_str)
+        
+        # Expanded list of models for better fallback
+        models_to_try = [model, "flux", "turbo", "unity", "dreamshaper", "deliberate"]
+        # Remove duplicates while preserving order
+        models_to_try = list(dict.fromkeys(models_to_try))
+        
+        for current_model in models_to_try:
+            image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&seed={seed}&model={current_model}&nologo=true"
+            
+            # Simple retry mechanism for each model
+            max_retries = 2
+            for attempt in range(max_retries):
+                try:
+                    print(f" [IMAGE] Attempting {current_model} (Attempt {attempt+1}/{max_retries})...")
+                    response = requests.get(image_url, timeout=45)
+                    
+                    if response.status_code == 200:
+                        img = Image.open(BytesIO(response.content))
+                        if img.mode != 'RGB':
+                            img = img.convert('RGB')
+                        
+                        data_url = convert_image_to_webp_and_encode_base64(img, target_width=800, target_height=600)
+                        
+                        # Use absolute path for saving
+                        output_path = Path(filename.replace(".png", ".webp"))
+                        img.save(output_path, format="WEBP", quality=80)
+                        
+                        print(f" [IMAGE] Success! Saved to {output_path}")
+                        return data_url, str(output_path)
+                    
+                    elif response.status_code == 429:
+                        print(f" [IMAGE] Rate limited (429). Waiting...")
+                        time.sleep(2 * (attempt + 1))
+                    else:
+                        print(f" [IMAGE] Model {current_model} failed with status {response.status_code}")
+                        break # Try next model
+                        
+                except Exception as inner_e:
+                    print(f" [IMAGE] Model {current_model} error: {inner_e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(1)
+                    else:
+                        break
+                        
+        print(" [IMAGE] All models failed to generate image.")
         return "", ""
+    except Exception as e:
+        print(f" [IMAGE] Ultimate generation error: {e}")
+        return "", ""
+
     
 # Get type-specific content
 def get_type_specific_content(content_type, user_topic):
@@ -1197,12 +1350,12 @@ def clean_tags(tags, user_topic, content_type):
             f"{base_tag} experience",
             f"{base_tag} visit"
         ]
-        cleaned_tags.extend(additional_tags[:4-len(cleaned_tags)])
-    return list(set(cleaned_tags))[:12]
+        cleaned_tags.extend(additional_tags[:4-len(cleaned_tags)]) # type: ignore
+    return list(set(cleaned_tags))[:12] # type: ignore
 
 # ===== ORIGINAL RUN AGENT FUNCTION (RENAMED) =====
 
-async def run_agent_original(user_topic: str, more_details: str = None):
+async def run_agent_original(user_topic: str, more_details: Optional[str] = None):
     """Runs all agents to generate content for a given topic using MagenticOneGroupChat""" 
     current_date = datetime.now().strftime("%B %d, %Y")
     goa_db = get_mongodb_connection()
@@ -1274,8 +1427,8 @@ Return a single JSON object with the following keys:
     tags_result = await safe_run(tags_agent, f"Generate 8-12 SEO tags for {content_type}: {user_topic}")
     content = await safe_run(content_agent, f"Generate detailed HTML content for {content_type}: {user_topic}")
     guidelines = await safe_run(guidelines_agent, f"Generate 4-6 guidelines for {content_type}: {user_topic}")
-    image_prompt = await safe_run(image_prompt_agent, f"Generate a detailed image prompt for {content_type}: {user_topic}")
-    thumbnail_prompt = await safe_run(thumbnail_prompt_agent, f"Generate a thumbnail prompt for {content_type}: {user_topic}")
+    image_prompt = await safe_run(image_prompt_agent, f"Generate a detailed, vivid image prompt for {user_topic}")
+    thumbnail_prompt = await safe_run(thumbnail_prompt_agent, f"Generate a focused thumbnail prompt for {user_topic}")
     seo_title = await safe_run(seo_title_agent, f"Generate two SEO titles for {content_type}: {user_topic}")
     transportation_options = await safe_run(transportation_options_agent, f"Generate transportation options for {content_type}: {user_topic}")
 
@@ -1298,8 +1451,8 @@ Return a single JSON object with the following keys:
     tags_raw = parsed_result.get("tags", tags_result if isinstance(tags_result, dict) else {"tags": []})
     content = parsed_result.get("content", content if content else f"<p><strong>{user_topic}</strong>: No content generated.</p>")
     guidelines = parsed_result.get("guidelines", guidelines if guidelines else f"Follow local guidelines when visiting {user_topic}.")
-    image_prompt = parsed_result.get("image_prompt", image_prompt if image_prompt else f"Photorealistic image of {user_topic} at sunset, serene atmosphere, high-resolution.")
-    thumbnail_prompt = parsed_result.get("thumbnail_prompt", thumbnail_prompt if thumbnail_prompt else f"Vibrant square photo of {user_topic}, high resolution.")
+    image_prompt = parsed_result.get("image_prompt", image_prompt if image_prompt else f"{user_topic} landscape")
+    thumbnail_prompt = parsed_result.get("thumbnail_prompt", thumbnail_prompt if thumbnail_prompt else f"{user_topic} photo")
     seo_title = parsed_result.get("seo_title", seo_title.split('\n') if isinstance(seo_title, str) and seo_title else [f"Explore {user_topic} in 2025", f"{user_topic} Travel Guide"])
     transportation_options = parsed_result.get("transportation_options", transportation_options if isinstance(transportation_options, dict) else {
         "walkingOnly": False, "byBoat": False, "byCar": True, "byPublicTransport": True
@@ -1389,8 +1542,8 @@ Return a single JSON object with the following keys:
     # Generate images
     main_filename = f"{content_type}-{user_topic.lower().replace(' ', '-')}.png"
     thumbnail_filename = f"thumbnail-{content_type}-{user_topic.lower().replace(' ', '-')}.png"
-    image_data_url, saved_file = generate_image_pollinations(image_prompt, main_filename)
-    thumbnail_data_url, thumbnail_file = generate_image_pollinations(thumbnail_prompt, thumbnail_filename, 512, 512)
+    image_data_url, saved_file = generate_image_pollinations(image_prompt, main_filename, 512, 512, content_type=content_type)
+    thumbnail_data_url, thumbnail_file = generate_image_pollinations(thumbnail_prompt, thumbnail_filename, 256, 256, content_type=content_type)
 
     # Set location data
     type_config = get_type_specific_content(content_type, user_topic)
@@ -1421,7 +1574,7 @@ Return a single JSON object with the following keys:
         "_id": ObjectId(),
         "gallery": gallery_urls,
         "tags": tags,
-        "categories": [ObjectId(category_id)] if category_id else [ObjectId()],
+        "categories": [category_id] if category_id else [],
         "active": boolean_options.get("active", False),
         "featured": boolean_options.get("featured", False),
         "postType": content_type,
@@ -1439,9 +1592,9 @@ Return a single JSON object with the following keys:
         "author": ObjectId(),
         "thumbnail": thumbnail_url,
         "createdAt": datetime.utcnow(),
-        "rating": ObjectId(),
-        "likes": ObjectId(),
-        "views": ObjectId(),
+        "rating": 0,
+        "likes": 0,
+        "views": 0,
         "__v": 0,
         "hasPickup": boolean_options.get("hasPickup", False),
         "internal": boolean_options.get("internal", False),
@@ -1475,24 +1628,21 @@ Return a single JSON object with the following keys:
 
     return output, saved_file, thumbnail_file, filename_json, content_type, goa_db, formatted_json
 
-async def run_agent_original_with_validation(user_topic: str, more_details: str = None):
+async def run_agent_original_with_validation(user_topic: str, more_details: Optional[str] = None) -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
     """Enhanced version with proper location validation and NO double-fetching"""
     current_date = datetime.now().strftime("%B %d, %Y")
     goa_db = get_mongodb_connection()
 
     # Get model
-    openrouter_key = os.getenv("OPENROUTER_KEY")
+    openrouter_key = get_openrouter_key()
     if not openrouter_key:
-        if os.path.exists("api.txt"):
-            openrouter_key = open("api.txt").read().strip()
-        else:
-            raise RuntimeError("No OpenRouter API key found.")
+        raise RuntimeError("No OpenRouter API key found.")
 
     model = OpenAIChatCompletionClient(
         model="gpt-4o-mini",
         api_key=openrouter_key,
         base_url="https://openrouter.ai/api/v1",
-        max_tokens=500
+        max_tokens=150
     )
 
     print(" Classifying content type...")
@@ -1512,10 +1662,10 @@ async def run_agent_original_with_validation(user_topic: str, more_details: str 
     if should_fetch_location and search_query:
         location_data = await fetch_and_validate_location(user_topic, search_query, content_type, model)
         if location_data.get("error") or not location_data.get("address"):
-            print("⚠️ Falling back to basic fetch...")
+            print("[WARN] Falling back to basic fetch...")
             location_data = fetch_location(f"{search_query}, Goa, India")  # Final fallback
     else:
-        print("ℹ Location not needed for this content type")
+        print("[INFO] Location not needed for this content type")
 
     # Now run all other agents (same as before)
     (content_classifier_agent, smart_location_agent, description_agent, tags_agent, content_agent,
@@ -1526,8 +1676,8 @@ async def run_agent_original_with_validation(user_topic: str, more_details: str 
     tags_result = await safe_run(tags_agent, f"Generate 8-12 SEO tags for {content_type}: {user_topic}")
     content = await safe_run(content_agent, f"Generate detailed HTML content for {content_type}: {user_topic}")
     guidelines = await safe_run(guidelines_agent, f"Generate 4-6 guidelines for {content_type}: {user_topic}")
-    image_prompt = await safe_run(image_prompt_agent, f"Generate a detailed image prompt for {content_type}: {user_topic}")
-    thumbnail_prompt = await safe_run(thumbnail_prompt_agent, f"Generate a thumbnail prompt for {content_type}: {user_topic}")
+    image_prompt = await safe_run(image_prompt_agent, f"Generate a detailed, vivid image prompt for {user_topic}")
+    thumbnail_prompt = await safe_run(thumbnail_prompt_agent, f"Generate a focused thumbnail prompt for {user_topic}")
     seo_title = await safe_run(seo_title_agent, f"Generate two SEO titles for {content_type}: {user_topic}")
     transportation_options = await safe_run(transportation_options_agent, f"Generate transportation options for {content_type}: {user_topic}")
     boolean_options = await get_boolean_options(content_type, user_topic, model_full)
@@ -1546,15 +1696,16 @@ async def run_agent_original_with_validation(user_topic: str, more_details: str 
     # Generate images
     main_filename = f"{content_type}-{user_topic.lower().replace(' ', '-')}.png"
     thumbnail_filename = f"thumbnail-{content_type}-{user_topic.lower().replace(' ', '-')}.png"
-    image_data_url, saved_file = generate_image_pollinations(image_prompt, main_filename)
-    thumbnail_data_url, thumbnail_file = generate_image_pollinations(thumbnail_prompt, thumbnail_filename, 512, 512)
+    image_data_url, saved_file = generate_image_pollinations(image_prompt, main_filename, 512, 512, content_type=content_type)
+    thumbnail_data_url, thumbnail_file = generate_image_pollinations(thumbnail_prompt, thumbnail_filename, 256, 256, content_type=content_type)
 
-    # Use OUR validated location_data — DO NOT refetch!
+    # Use OUR validated location_data â€” DO NOT refetch!
+    loc = location_data if location_data else {}
     final_location = {
-        "address": location_data.get("address"),
-        "latitude": float(location_data.get("latitude", 0.0)),
-        "longitude": float(location_data.get("longitude", 0.0))
-    } if location_data.get("address") else {"address": None, "latitude": 0.0, "longitude": 0.0}
+        "address": loc.get("address"),
+        "latitude": float(str(loc.get("latitude", 0.0))),
+        "longitude": float(str(loc.get("longitude", 0.0)))
+    } if loc.get("address") else {"address": None, "latitude": 0.0, "longitude": 0.0}
 
     # Find place IDs
     place_ids = find_place_ids(final_location.get("address"), goa_db) if final_location.get("address") else {"city_id": None, "area_id": None, "state_id": None}
@@ -1567,7 +1718,7 @@ async def run_agent_original_with_validation(user_topic: str, more_details: str 
         "_id": ObjectId(),
         "gallery": [image_data_url] if image_data_url else [],
         "tags": tags,
-        "categories": [ObjectId(category_id)] if category_id else [],
+        "categories": [category_id] if category_id else [],
         "active": True,
         "featured": False,
         "postType": content_type,
@@ -1576,7 +1727,7 @@ async def run_agent_original_with_validation(user_topic: str, more_details: str 
         "shortDescription": description or f"Discover {user_topic}, a beautiful destination in Goa.",
         "seoTitle": seo_title[0] if isinstance(seo_title, list) and seo_title else f"Explore {user_topic} - Goa Travel Guide",
         "icon": type_config.get("icon", "fa-duotone fa-book-open"),
-        "text": content or f"<p>Explore {user_topic} – a must-visit spot in Goa.</p>",
+        "text": content or f"<p>Explore {user_topic} â€“ a must-visit spot in Goa.</p>",
         "guidelines": guidelines or "Always respect local rules and nature.",
         "location": final_location,
         "ways": transportation_options or {"walkingOnly": False, "byBoat": False, "byCar": True, "byPublicTransport": True},
@@ -1601,7 +1752,7 @@ async def run_agent_original_with_validation(user_topic: str, more_details: str 
     return output, saved_file, thumbnail_file, filename_json, content_type, goa_db, formatted_json
 
 # ===== FALLBACK CONTENT GENERATION FUNCTION =====
-async def generate_basic_fallback(user_topic: str, more_details: str, goa_db):
+async def generate_basic_fallback(user_topic: str, more_details: Optional[str], goa_db: Any) -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
     """Simple backup content when main generator fails"""
     print("Using fallback content generation...")
     
@@ -1670,7 +1821,7 @@ async def generate_basic_fallback(user_topic: str, more_details: str, goa_db):
 
 # ===== SMART CONTENT GENERATION FUNCTION =====
 
-async def smart_content_generation(user_topic: str, more_details: str = None):
+async def smart_content_generation(user_topic: str, more_details: Optional[str] = None) -> Tuple[Any, Any, Any, Any, Any, Any, Any]:
     """Smart content generation with location validation"""
     current_date = datetime.now()
     goa_db = get_mongodb_connection()
@@ -1687,13 +1838,13 @@ async def smart_content_generation(user_topic: str, more_details: str = None):
          transportation_options_agent), model = teamConfig()
         
         # VALIDATE EXISTING LOCATION IN DATABASE
-        print("🔍 Validating existing location in database...")
+        print("[CHECK] Validating existing location in database...")
         location_validation = await validate_existing_location_in_db(
             existing_doc, user_topic, existing_doc.get('postType', 'blog'), model
         )
         
         created_at = existing_doc.get('createdAt')
-        updated_fields = {}
+        updated_fields: Dict[str, Any] = {}
         updates_made = []
         
         # 1. Check and Update LOCATION if invalid
@@ -1706,7 +1857,7 @@ async def smart_content_generation(user_topic: str, more_details: str = None):
             search_query = location_result.get("search_query", user_topic)
             
             if should_fetch_location:
-                print(f"🔍 Fetching new location with query: '{search_query}'")
+                print(f"[SEARCH] Fetching new location with query: '{search_query}'")
                 new_location = await fetch_and_validate_location(user_topic, search_query, existing_doc.get('postType', 'blog'), model)
                 
                 if new_location and not new_location.get("error") and new_location.get("address"):
@@ -1724,7 +1875,7 @@ async def smart_content_generation(user_topic: str, more_details: str = None):
         old_description = existing_doc.get('shortDescription', '')
         if needs_field_update(old_description, user_topic, created_at, is_content_field=False):
             print(" Updating description...")
-            new_description = await safe_run(description_agent, f"Generate accurate description for {user_topic}")
+            new_description = await safe_run(description_agent, f"Generate a 1-sentence description for {user_topic}")
             if new_description and new_description.strip():
                 updated_fields['shortDescription'] = new_description
                 updates_made.append('description')
@@ -1752,6 +1903,36 @@ async def smart_content_generation(user_topic: str, more_details: str = None):
                 updates_made.append('guidelines')
                 print(" Guidelines updated")
         
+        # 5. Check and Update IMAGES if empty
+        old_gallery = existing_doc.get('gallery', [])
+        old_thumbnail = existing_doc.get('thumbnail', [])
+        
+        if not old_gallery or not old_thumbnail:
+            print(f"[DEBUG] Found missing images for '{user_topic}'. Gallery empty: {not old_gallery}, Thumbnail empty: {not old_thumbnail}")
+            print(" Updating missing images...")
+            content_type = existing_doc.get('postType', 'blog')
+            
+            # Generate prompts
+            image_prompt = await safe_run(image_prompt_agent, f"Generate a detailed, vivid image prompt for {user_topic}")
+            thumbnail_prompt = await safe_run(thumbnail_prompt_agent, f"Generate a focused thumbnail prompt for {user_topic}")
+            
+            main_filename = f"{content_type}-{user_topic.lower().replace(' ', '-')}.png"
+            thumbnail_filename = f"thumbnail-{content_type}-{user_topic.lower().replace(' ', '-')}.png"
+            
+            if not old_gallery:
+                image_data_url, saved_file = generate_image_pollinations(image_prompt, main_filename, 512, 512, content_type=content_type)
+                if image_data_url:
+                    updated_fields['gallery'] = [image_data_url]
+                    updates_made.append('gallery')
+                    print(f" Main image generated: {saved_file}")
+            
+            if not old_thumbnail:
+                thumbnail_data_url, thumb_file = generate_image_pollinations(thumbnail_prompt, thumbnail_filename, 256, 256, content_type=content_type)
+                if thumbnail_data_url:
+                    updated_fields['thumbnail'] = [thumbnail_data_url]
+                    updates_made.append('thumbnail')
+                    print(f" Thumbnail generated: {thumb_file}")
+        
         # Update the document if any fields were updated
         if updated_fields:
             slug = existing_doc.get('slug', user_topic.lower().replace(' ', '-'))
@@ -1766,7 +1947,8 @@ async def smart_content_generation(user_topic: str, more_details: str = None):
             updated_doc = get_document_by_topic(user_topic, goa_db)
             formatted_json = format_document(updated_doc) if updated_doc else None
             
-            return updated_doc, None, None, None, updated_doc.get('postType', 'blog'), goa_db, formatted_json
+            post_type = updated_doc.get('postType', 'blog') if updated_doc else 'blog'
+            return updated_doc, None, None, None, post_type, goa_db, formatted_json
         else:
             print("No updates needed - returning existing content")
             formatted_json = format_document(existing_doc)
@@ -1797,16 +1979,16 @@ def main():
             user_topic = args.topic.strip()
             more_details = args.details.strip() if args.details else None
         else:
-            print("🔹 Enter a topic (or press Ctrl+C to exit): ", end="", flush=True)
+            print("Enter a topic (or press Ctrl+C to exit): ", end="", flush=True)
             try:
                 user_topic = input().strip()
             except EOFError:
-                print("\n Input failed - running in non-interactive mode. Use: python travel_content_generator.py 'topic' ['details']")
+                print("\n Input failed - running in non-interactive mode. Use: python optimizetreavel.py 'topic' ['details']")
                 return
             if not user_topic:
                 print(" No topic entered. Exiting.")
                 return
-            print("🔹 Enter more about the topic (optional, press enter to skip): ", end="", flush=True)
+            print("Enter more about the topic (optional, press enter to skip): ", end="", flush=True)
             more_details = input().strip() or None
 
         print(f" [Smart Mode] Processing: '{user_topic}'")
@@ -1832,9 +2014,9 @@ def main():
             print(f"JSON file: {json_file}")
             
     except KeyboardInterrupt:
-        print("\n❌ Operation cancelled by user")
+        print("\n[CANCEL] Operation cancelled by user")
     except Exception as e:
-        print(f"❌ Unexpected error: {e}")
+        print(f"\n[ERROR] Unexpected error: {e}")
         import traceback
         traceback.print_exc()
 
