@@ -7,6 +7,15 @@ try:
     nest_asyncio.apply()  # Allows asyncio.run() inside Streamlit's event loop
 except ImportError:
     pass  # nest_asyncio not installed; asyncio.run() may raise on some setups
+    
+    try:
+    from GoaInsight import smart_content_generation as _smart_content_generation
+    _BACKEND_AVAILABLE = True
+    st.sidebar.success("✅ Backend loaded OK")
+except Exception as e:
+    _BACKEND_AVAILABLE = False
+    st.error(f"❌ Backend failed to load:\n\n```\n{traceback.format_exc()}\n```")
+    st.stop()
 
 try:
     from GoaInsight import smart_content_generation as _smart_content_generation
