@@ -1,13 +1,13 @@
-
 import streamlit as st
 import asyncio
+import traceback
 
 try:
     import nest_asyncio
-    nest_asyncio.apply()  # Allows asyncio.run() inside Streamlit's event loop
+    nest_asyncio.apply()
 except ImportError:
-    pass  # nest_asyncio not installed; asyncio.run() may raise on some setups
-    
+    pass
+
 try:
     from GoaInsight import smart_content_generation as _smart_content_generation
     _BACKEND_AVAILABLE = True
