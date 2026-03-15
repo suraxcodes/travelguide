@@ -12,9 +12,9 @@
 
 ## 🧭 What is GoaInsight?
 
-**GoaInsight** is a full-stack, AI-powered travel intelligence platform that generates rich, structured travel content for any destination in Goa — and beyond. You type a topic (e.g., *"Colva Beach"*, *"Baga Nightlife"*, *"Anjuna Flea Market"*), and the system dispatches a squad of specialized AI agents that collaboratively produce descriptions, full editorial content, geo-coordinates, travel guidelines, SEO titles, tags, AI-generated images, and a lot more — all stored in MongoDB and rendered in a stunning real-time UI.
+**GoaInsight** is a full-stack, AI-powered travel intelligence platform that generates rich, structured travel content for any destination in Goa — and beyond. You type a topic (e.g., *"Colva Beach"*, *"Baga Nightlife"*, *"Anjuna Flea Market"*), and the system dispatches a squad of specialized AI agents that collaboratively produce descriptions, full editorial content, geo-coordinates, travel guidelines, SEO titles, tags, high-quality professional photos, and a lot more — all stored in MongoDB and rendered in a stunning real-time UI.
 
-This is not a chatbot. It is an **agentic content generation pipeline** with a production-grade database layer, intelligent caching, smart update detection, and a live Streamlit dashboard.
+This is not a chatbot. It is an **agentic content generation pipeline** with a production-grade database layer, intelligent caching, real-time web scraping (RAG), and a live Streamlit dashboard.
 
 ---
 
@@ -22,14 +22,14 @@ This is not a chatbot. It is an **agentic content generation pipeline** with a p
 
 | Feature | Why It's Different |
 |---|---|
-| 🤖 **Multi-Agent Architecture** | Uses Microsoft AutoGen's `MagenticOneGroupChat` — multiple specialized agents collaborate in parallel, not one monolithic prompt |
-| 🧠 **Smart Update Engine** | Detects stale, wrong-location, or generic AI content and surgically updates only the fields that need it |
-| 📡 **Live Geo-Tracking** | Fetches, validates, caches, and reverse-geocodes coordinates via Nominatim (OpenStreetMap) — with retry strategies |
-| 🖼️ **AI Image Generation** | Generates full gallery images and thumbnails via Pollinations API, encoded as WebP base64 data URIs |
-| 🗄️ **MongoDB-First** | Every piece of content is persisted, deduped, and enriched in a structured MongoDB Atlas collection |
-| 🎨 **Cyberpunk UI** | A fully custom Streamlit interface with a neon-grid aesthetic, animated status indicators, and real-time panels |
-| 🔀 **Dual LLM Support** | Switch between a **local Ollama model** (e.g., DeepSeek, LLaMA3) and **OpenRouter** (e.g., GPT-4o-mini) with one config flag |
-| 🔒 **Flexible API Key Management** | Resolves credentials from env vars → Streamlit Secrets → local `api.txt` — works locally and in production |
+| 🤖 **Multi-Agent Architecture** | Uses Microsoft AutoGen's `MagenticOneGroupChat` — multiple specialized agents collaborate in parallel |
+| 📡 **Real-Time Web Scraping** | **NEW:** Scrapes Wikipedia and DuckDuckGo for factual ground-truth before writing |
+| 🧠 **Smart Update Engine** | Detects stale, wrong-location, or generic AI content and surgically updates only what's needed |
+| 🗺️ **Live Geo-Tracking** | Fetches, validates, and reverse-geocodes coordinates via Nominatim (OpenStreetMap) |
+| 🖼️ **Unsplash Integration** | **NEW:** Fetches high-quality travel photography directly from the Unsplash API |
+| 🗄️ **MongoDB-First** | Every piece of content is persisted and enriched in a structured MongoDB Atlas collection |
+| 🎨 **Cyberpunk UI** | A fully custom Streamlit interface with a neon-grid aesthetic and animated HUDs |
+| 🔀 **Dual LLM Support** | Switch between a **local Ollama model** and **OpenRouter** with one config flag |
 
 ---
 
@@ -96,14 +96,14 @@ Each agent is a focused `AssistantAgent` from AutoGen, orchestrated by `Magentic
 | Agent | Role |
 |---|---|
 | `smart_location_agent` | Decides whether geo-lookup is needed and crafts the optimal search query |
-| `location_validator_agent` | Validates that fetched coordinates actually match the topic |
-| `description_agent` | Writes a punchy 1-sentence summary of the destination |
+| `description_agent` | **RAG Enabled:** Writes facts-first descriptions using scraped web data |
 | `content_agent` | Generates full editorial HTML content tailored to the content type |
 | `guidelines_agent` | Produces practical visitor tips, dos & don'ts |
-| `image_prompt_agent` | Crafts a detailed, vivid image generation prompt |
-| `thumbnail_prompt_agent` | Crafts a focused, square-format thumbnail prompt |
+| `image_prompt_agent` | Crafts detailed prompts for high-resolution Unsplash images |
+| `thumbnail_prompt_agent` | Crafts focused prompts for square-format thumbnails |
 | `tags_agent` | Generates a keyword tag matrix for discovery |
-| `seo_agent` | Outputs two SEO-optimized title variants |
+| `seo_title_agent` | Outputs two SEO-optimized title variants |
+| `transportation_agent` | Calculates accessibility (Walking, Boat, Car, Public Transport) |
 
 ---
 
@@ -135,13 +135,12 @@ Location resolution uses a multi-strategy approach:
 
 ---
 
-## 🖼️ AI Image Generation
+## 🖼️ High-Quality Imagery
 
-Images are generated via the **Pollinations API** (free, no key required):
-
-- **Main gallery image**: `512×512`, saved as PNG + encoded as WebP base64 data URI
-- **Thumbnail**: `256×256`, same pipeline
-- Images are embedded directly into MongoDB as data URIs, so no external image hosting is required
+We use the **Unsplash API** to provide professional visuals instead of basic AI generation:
+- **Main gallery image**: Fetched via API using the agent-generated prompt.
+- **Thumbnail**: A second, distinct professional photo fetched in the same search.
+- **CDN Powered**: Images are pulled directly from Unsplash CDNs, ensuring fast load times in the UI.
 
 ---
 
@@ -163,9 +162,9 @@ pip install -r requirements.txt
 **Key dependencies:**
 - `streamlit`
 - `autogen-agentchat`, `autogen-ext[openai]`
-- `pymongo`
-- `Pillow`
-- `requests`
+- `wikipedia-api`, `ddgs` (Scraper engines)
+- `pymongo` (Database)
+- `requests`, `Pillow`
 
 ### 3. Configure your API key
 
@@ -247,17 +246,13 @@ python optimizetreavel.py "Colva Beach" "Known for its long stretch and Saturday
 
 ---
 
-## 🛠️ Tech Stack
-
 | Layer | Technology |
 |---|---|
-| Frontend | Streamlit + Custom CSS (Orbitron / Share Tech Mono / Rajdhani fonts) |
+| Frontend | Streamlit + Custom CSS (Orbitron / Rajdhani fonts) |
 | AI Agents | Microsoft AutoGen — `MagenticOneGroupChat` |
-| LLM Backend | OpenRouter (GPT-4o-mini) or local Ollama |
-| Image Generation | Pollinations API |
-| Geocoding | OpenStreetMap Nominatim |
+| Scrapers | Wikipedia-API + DuckDuckGo (DDGS) |
+| Image Gen | Unsplash API |
 | Database | MongoDB Atlas (PyMongo) |
-| Image Processing | Pillow (PIL) — WebP encoding |
 
 ---
 
@@ -275,7 +270,7 @@ python optimizetreavel.py "Colva Beach" "Known for its long stretch and Saturday
 ## 👨‍💻 Developer
 
 Built by **Suraj Gawas**  
-`GOAINSIGHT // TRAVEL·GUIDE·OS v2.4.1 // ALL SYSTEMS NOMINAL`
+`GOAINSIGHT // TRAVEL·GUIDE·OS v2.5.0 // ALL SYSTEMS NOMINAL`
 
 ---
 
