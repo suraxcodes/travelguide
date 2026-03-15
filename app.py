@@ -1,6 +1,18 @@
 import streamlit as st
 import asyncio
 
+try:
+    import nest_asyncio
+    nest_asyncio.apply()  # Allows asyncio.run() inside Streamlit's event loop
+except ImportError:
+    pass  # nest_asyncio not installed; asyncio.run() may raise on some setups
+
+try:
+    from optimizetreavel import smart_content_generation as _smart_content_generation
+    _BACKEND_AVAILABLE = True
+except ImportError:
+    _BACKEND_AVAILABLE = False
+
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="GoaInsight: AI Travel Guide",
@@ -275,8 +287,9 @@ with center:
         st.session_state.chat_messages.append({"role": "user", "content": user_prompt})
         with st.spinner("PROCESSING…"):
             try:
-                from optimizetreavel import smart_content_generation
-                output, *_ , content_type, goa_db, _ = asyncio.run(smart_content_generation(user_prompt.strip(), None))
+                if not _BACKEND_AVAILABLE:
+                    raise ImportError("optimizetreavel not available")
+                output, *_ , content_type, goa_db, _ = asyncio.run(_smart_content_generation(user_prompt.strip(), None))
                 st.session_state.output = output
                 title = output.get("title", user_prompt.title())
                 short = output.get("shortDescription","")
@@ -393,14 +406,16 @@ with right:
 if scan_btn and topic.strip():
     with st.spinner("INITIATING DEEP SCAN…"):
         try:
-            from optimizetreavel import smart_content_generation
+            if not _BACKEND_AVAILABLE:
+                raise ImportError("optimizetreavel not available")
             output, saved_file, thumbnail_file, json_file, content_type, goa_db, formatted_json = asyncio.run(
-                smart_content_generation(topic.strip(), details.strip() or None)
+                _smart_content_generation(topic.strip(), details.strip() or None)
             )
             st.session_state.update({'output':output,'generated':True,'saved_file':saved_file,
                 'thumbnail_file':thumbnail_file,'json_file':json_file,
                 'content_type':content_type,'goa_db':goa_db})
         except ImportError:
+            st.warning("⚠ Backend module not found — showing demo data.", icon="⚠")
             st.session_state.update({
                 'output':{
                     'title':topic.title(),

@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import json
 import base64
@@ -9,17 +10,18 @@ import urllib.parse
 import streamlit as st
 from io import BytesIO
 from PIL import Image
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Optional, Any, List, Tuple
 from pymongo import MongoClient
+from pymongo.server_api import ServerApi
 from bson import ObjectId
 from collections import OrderedDict
 from autogen_agentchat.agents import AssistantAgent 
 from autogen_agentchat.teams import MagenticOneGroupChat
 from autogen_ext.models.openai import OpenAIChatCompletionClient
-from pymongo.mongo_client import MongoClient
-from pymongo.server_api import ServerApi
+import wikipediaapi
+from ddgs import DDGS
 
 # ===== LLM BACKEND CONFIGURATION =====
 # Set USE_OLLAMA = True to use a local LLM via Ollama
@@ -68,29 +70,31 @@ def get_llm_client():
 # Set UTF-8 encoding for Windows console to handle emojis
 
 CACHE_FILE = Path("location_cache.json")
-if CACHE_FILE.exists():
-    with open(CACHE_FILE, "r", encoding="utf-8") as f:
-        LOCATION_CACHE: dict = json.load(f)
-else:
-    LOCATION_CACHE: dict = {}
+
+def _load_location_cache() -> dict:
+    if CACHE_FILE.exists():
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+LOCATION_CACHE: dict = _load_location_cache()
 
 def get_openrouter_key() -> str:
-    """Get OpenRouter API key from ENV, Streamlit Secrets, or local api.txt"""
-    # 1. Check Environment Variable
+    """Get OpenRouter API key from ENV, Streamlit Secrets, or local api.txt (line 1)"""
     key = os.getenv("OPENROUTER_KEY")
     if key:
         return key
-    
-    # 2. Check Streamlit Secrets (for deployment)
     try:
         if "MY_API_KEY" in st.secrets:
             return st.secrets["MY_API_KEY"]
         if "OPENROUTER_KEY" in st.secrets:
             return st.secrets["OPENROUTER_KEY"]
-    except (ImportError, Exception):
+    except Exception:
         pass
-
-    # 3. Check Local api.txt
+    # Local: read first line of api.txt
     candidates = [
         Path(__file__).resolve().parent / "api.txt",
         Path(__file__).resolve().parents[1] / "api.txt",
@@ -98,9 +102,106 @@ def get_openrouter_key() -> str:
     ]
     for p in candidates:
         if p.exists():
-            return p.read_text(encoding="utf-8").strip()
-            
+            return p.read_text(encoding="utf-8").splitlines()[0].strip()
     return ""
+
+
+def get_unsplash_key() -> str:
+    """Get Unsplash Access Key from ENV, Streamlit Secrets, or local api.txt.
+    Priority: ENV > st.secrets > api.txt (line containing UNSPLASH_ACCESS_KEY)
+    """
+    key = os.getenv("UNSPLASH_KEY") or os.getenv("UNSPLASH_ACCESS_KEY")
+    if key:
+        return key
+    try:
+        if "UNSPLASH_KEY" in st.secrets:
+            return st.secrets["UNSPLASH_KEY"]
+        if "UNSPLASH_ACCESS_KEY" in st.secrets:
+            return st.secrets["UNSPLASH_ACCESS_KEY"]
+    except Exception:
+        pass
+    # Local: parse line with UNSPLASH_ACCESS_KEY = "..." from api.txt
+    candidates = [
+        Path(__file__).resolve().parent / "api.txt",
+        Path(__file__).resolve().parents[1] / "api.txt",
+        Path("api.txt"),
+    ]
+    for p in candidates:
+        if p.exists():
+            for line in p.read_text(encoding="utf-8").splitlines():
+                if "UNSPLASH_ACCESS_KEY" in line and "=" in line:
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+def fetch_images_unsplash(query: str, count: int = 2) -> list:
+    """Fetch topic-relevant image URLs from Unsplash API.
+    Returns a list of https:// image URLs (up to `count`).
+    Returns an empty list if API key is missing or request fails.
+    """
+    access_key = get_unsplash_key()
+    if not access_key:
+        print(" [UNSPLASH] No API key found, skipping.")
+        return []
+    try:
+        url = "https://api.unsplash.com/search/photos"
+        params = {
+            "query": query,
+            "per_page": count,
+            "orientation": "landscape",
+            "client_id": access_key,
+        }
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            results = response.json().get("results", [])
+            imgs = [r["urls"]["regular"] for r in results if r.get("urls", {}).get("regular")]
+            if imgs:
+                print(f" [UNSPLASH] Fetched {len(imgs)} image(s) for '{query}'")
+            else:
+                print(f" [UNSPLASH] No images found for '{query}'")
+            return imgs[:count]
+        else:
+            print(f" [UNSPLASH] API error {response.status_code}: {response.text[:100]}")
+            return []
+    except Exception as e:
+        print(f" [UNSPLASH] Request failed: {e}")
+        return []
+
+def fetch_wikipedia_description(topic: str) -> str:
+    """Fetch summary from Wikipedia for the given topic."""
+    try:
+        # Use a descriptive user agent as required by Wikipedia
+        wiki = wikipediaapi.Wikipedia(
+            user_agent="TravelGuideBot/1.0 (contact@travelguide.com)",
+            language="en"
+        )
+        page = wiki.page(topic)
+        if page.exists():
+            # Return first two paragraphs or snippet
+            summary = page.summary
+            if summary:
+                # Limit to around 500 chars for context
+                return summary[:800]
+        return ""
+    except Exception as e:
+        print(f" [WIKIPEDIA] Error: {e}")
+        return ""
+
+def fetch_duckduckgo_description(topic: str) -> str:
+    """Fetch snippet from DuckDuckGo for the given topic."""
+    try:
+        with DDGS() as ddgs:
+            # Correct parameter name for ddgs package
+            results = list(ddgs.text(query=topic, max_results=3))
+            if results:
+                # Combine snippets from top results
+                snippets = [r.get("body", "") for r in results if r.get("body")]
+                return " ".join(snippets)[:800]
+        return ""
+    except Exception as e:
+        print(f" [DUCKDUCKGO] Error: {e}")
+        return ""
+
 
 def save_cache():
     with open(CACHE_FILE, "w", encoding="utf-8") as f:
@@ -148,52 +249,9 @@ def generate_dynamic_map(location_name, lat=None, lon=None):
 
 def fetch_location_for_map(location_name):
     """
-    Fetch location data from Nominatim specifically for map generation with caching
+    Fetch location data using the robust fetch_location function
     """
-    key = location_name.strip()
-    cached = LOCATION_CACHE.get(key)
-    if cached and "latitude" in cached and "longitude" in cached:
-        return cached
-
-    url = "https://nominatim.openstreetmap.org/search"
-    
-    # Prioritize Indian locations
-    search_queries = [
-        f"{location_name}, Goa, India",
-        f"{location_name}, India",
-        location_name
-    ]
-    
-    for search_query in search_queries:
-        params = {
-            "q": search_query,
-            "format": "json",
-            "limit": 1,
-            "addressdetails": 1
-        }
-        
-        try:
-            response = requests.get(url, params=params, headers={
-                "User-Agent": "TravelGuideBot/1.0 (contact@travelguide.com)"
-            }, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            
-            if data:
-                location = data[0]
-                result = {
-                    "address": location.get("display_name", location_name),
-                    "latitude": float(location["lat"]),
-                    "longitude": float(location["lon"])
-                }
-                if isinstance(LOCATION_CACHE, dict):
-                    LOCATION_CACHE[key] = result
-                save_cache()
-                return result
-        except Exception:
-            continue
-    
-    return {"error": "Location not found", "address": location_name}
+    return fetch_location(location_name)
 
 def create_osm_map_html(lat, lon, location_name, address):
     """
@@ -294,7 +352,8 @@ def get_document_by_topic(topic, goa_db):
     document = collection.find_one({"slug": slug})
     if document:
         return document
-    document = collection.find_one({"title": {"$regex": f"^{topic}$", "$options": "i"}})
+    safe_topic = re.escape(topic)
+    document = collection.find_one({"title": {"$regex": f"^{safe_topic}$", "$options": "i"}})
     return document
 
 def is_content_outdated(created_at, days_threshold=60):
@@ -303,9 +362,12 @@ def is_content_outdated(created_at, days_threshold=60):
     if isinstance(created_at, str):
         try:
             created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-        except:
+        except Exception:
             return True
-    return (datetime.now() - created_at).days > days_threshold
+    # Normalise to naive UTC for comparison
+    if hasattr(created_at, 'tzinfo') and created_at.tzinfo is not None:
+        created_at = created_at.replace(tzinfo=None)
+    return (datetime.now(timezone.utc).replace(tzinfo=None) - created_at).days > days_threshold
 
 def contains_wrong_location(content, user_topic):
     if not content or not user_topic:
@@ -333,7 +395,9 @@ def missing_topic_name(content, user_topic):
 def contains_outdated_years(content):
     if not content:
         return False
-    return any(year in content.lower() for year in ["2023", "2022", "2021", "2020"])
+    current_year = datetime.now(timezone.utc).year
+    outdated_years = [str(y) for y in range(2020, current_year - 1)]
+    return any(year in content.lower() for year in outdated_years)
 
 def needs_field_update(field_content, user_topic, created_at, is_content_field=False):
     if not field_content or not field_content.strip():
@@ -356,7 +420,7 @@ def update_document_partial(goa_db, slug, updates):
     try:
         collection = goa_db["OUTPUT"]
         update_data = {"$set": updates}
-        update_data["$set"]["updatedAt"] = datetime.utcnow()
+        update_data["$set"]["updatedAt"] = datetime.now(timezone.utc)
         result = collection.update_one({"slug": slug}, update_data)
         return result.modified_count > 0
     except Exception as e:
@@ -375,31 +439,36 @@ def convert_image_to_webp_and_encode_base64(image: Image.Image, target_width=800
     return data_uri
 
 # MongoDB Connection
+@st.cache_resource
 def get_mongodb_connection():
-    """Establish MongoDB connection for goa-app database using MONGODB_URI env var or mongo_uri.txt."""
+    """Establish MongoDB connection for goa-app database.
+    Priority: MONGODB_URI env var > st.secrets[MONGODB_URI] > hardcoded URI > mongo_uri.txt
+    """
     try:
-        # Priority: Env Var > Hardcoded fallback > Files
-        mongo_uri = st.secrets["MONGODB_URI"]
-        
-        # If no env var, try to get from hardcoded string (fixing previous bug)
+        mongo_uri = os.getenv("MONGODB_URI", "")
+
+        # Streamlit secrets (used on deployment)
         if not mongo_uri:
-            # This looks like what was intended: a template to fill
-            # or a hardcoded string that was accidentally put in getenv
-            hardcoded_uri = "mongodb+srv://nomorevenxm_db_user:travelagent@cluster0.l3nhk4f.mongodb.net/?appName=Cluster0"
-            if "<db_password>" not in hardcoded_uri:
-                mongo_uri = hardcoded_uri
-        
+            try:
+                mongo_uri = st.secrets.get("MONGODB_URI", "")
+            except Exception:
+                mongo_uri = ""
+
+        # Hardcoded fallback for local development
         if not mongo_uri:
-            candidates = [
-                Path(__file__).resolve().parent / "mongo_uri.txt",
-                Path(__file__).resolve().parents[1] / "mongo_uri.txt",
-            ]
-            for p in candidates:
+            mongo_uri = "mongodb+srv://nomorevenxm_db_user:travelagent@cluster0.l3nhk4f.mongodb.net/?appName=Cluster0"
+
+        # File-based fallback
+        if not mongo_uri:
+            for p in [Path(__file__).resolve().parent / "mongo_uri.txt",
+                      Path(__file__).resolve().parents[1] / "mongo_uri.txt"]:
                 if p.exists():
                     mongo_uri = p.read_text(encoding="utf-8").strip()
                     break
+
         if not mongo_uri:
             return None
+
         client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
         client.admin.command('ping')
         return client['goa-app']
@@ -422,10 +491,10 @@ def insert_into_mongodb(output, goa_db):
         if "createdAt" in output and isinstance(output["createdAt"], str):
             try:
                 output["createdAt"] = datetime.fromisoformat(output["createdAt"].replace("Z", "+00:00"))
-            except:
-                output["createdAt"] = datetime.utcnow()
+            except Exception:
+                output["createdAt"] = datetime.now(timezone.utc)
         elif "createdAt" not in output:
-            output["createdAt"] = datetime.utcnow()
+            output["createdAt"] = datetime.now(timezone.utc)
         if collection.find_one({"slug": output["slug"]}):
             collection.update_one(
                 {"slug": output["slug"]},
@@ -519,9 +588,9 @@ async def fetch_and_validate_location(user_topic: str, search_query: str, conten
         if location_data.get("error"):
             print(f" Location fetch error: {location_data.get('error')}")
             if attempt < max_retries - 1:
-                print(" Retrying...")
-                time.sleep(2)  # Wait before retry
-                continue
+                    print(" Retrying...")
+                    await asyncio.sleep(2)  # Non-blocking async sleep
+                    continue
             else:
                 return location_data or {"error": "Location not found"}
         
@@ -571,8 +640,6 @@ async def fetch_and_validate_location(user_topic: str, search_query: str, conten
 
 def modify_search_query_for_retry(user_topic, content_type, attempt):
     """Modify search query for retry attempts"""
-    base_query = user_topic
-    
     if attempt == 0:
         # First retry: Add state if not present
         if "goa" not in user_topic.lower():
@@ -811,27 +878,38 @@ def fetch_location(address: str):
     cached = LOCATION_CACHE.get(key)
     if cached and "latitude" in cached and "longitude" in cached:
         return cached
+
     url = "https://nominatim.openstreetmap.org/search"
-    search_strategies = [
-        f"{address}, India",
-        *[f"{address}{state}" for state in [
-            ", Goa, India", ", Maharashtra, India", ", Karnataka, India",
-            ", Kerala, India", ", Tamil Nadu, India", ", Andhra Pradesh, India",
-            ", Odisha, India", ", West Bengal, India", ", Gujarat, India",
-            ", Andaman and Nicobar Islands, India"
-        ]],
-        f"{address} beach, India" if "beach" not in address.lower() else address,
-        *[f"{address} beach{state}" for state in [
-            ", Goa, India", ", Maharashtra, India", ", Karnataka, India",
-            ", Kerala, India", ", Tamil Nadu, India", ", Andhra Pradesh, India",
-            ", Odisha, India", ", West Bengal, India", ", Gujarat, India",
-            ", Andaman and Nicobar Islands, India"
-        ] if "beach" not in address.lower()],
-        address,
-        f"{address} beach" if "beach" not in address.lower() else address
-    ]
+    
+    # Clean common noise from search query
+    clean_address = address.strip()
+    for noise in ["in ", "at ", "near "]:
+        if clean_address.lower().startswith(noise):
+            clean_address = clean_address[len(noise):].strip()
+
+    search_strategies = []
+    
+    # 1. Exact as provided (if it looks like a full address)
+    search_strategies.append(clean_address)
+    
+    # 2. Force India if not present
+    if "india" not in clean_address.lower():
+        search_strategies.append(f"{clean_address}, India")
+        
+        # 3. Targeted states (if not already mentioning a state)
+        states = [", Goa", ", Maharashtra", ", Karnataka", ", Kerala", ", Tamil Nadu"]
+        if not any(s.lower().strip(", ") in clean_address.lower() for s in states):
+            for state in states:
+                search_strategies.append(f"{clean_address}{state}, India")
+
+    # 4. Handle beaches specifically
+    if "beach" not in clean_address.lower():
+        search_strategies.append(f"{clean_address} Beach, Goa, India")
+        search_strategies.append(f"{clean_address} Beach, India")
+
     unique_strategies = list(dict.fromkeys(search_strategies))
     best_indian_result = None
+    
     for search_query in unique_strategies:
         time.sleep(1.1)
         params = {
@@ -896,8 +974,8 @@ def get_category_id(goa_db, category_name):
                 "displayName": category_name.title(),
                 "slug": category_name.lower().replace(' ', '-'),
                 "active": True,
-                "createdAt": datetime.utcnow(),
-                "updatedAt": datetime.utcnow()
+                "createdAt": datetime.now(timezone.utc),
+                "updatedAt": datetime.now(timezone.utc)
             }
             result = categories_collection.insert_one(new_category)
             return result.inserted_id
@@ -911,29 +989,31 @@ def create_smart_location_agent(model, current_date):
         "smart_location_agent",
         model,
         description="Determines if location data should be fetched and what to search for",
-        system_message=f'''You are an expert location analyzer for INDIAN travel destinations as of {current_date}. Analyze the topic and determine:
+        system_message=f'''You are an expert location analyzer for travel destinations as of {current_date}. Analyze the topic and determine:
 1. Should we fetch location data?
 2. What exact search query should we use for the location API?
 
 RULES FOR FETCHING LOCATION:
-- YES: For beaches, landmarks, tourist spots, specific places, restaurants, events with locations (e.g., 'Shigmo Utsav, Goa', 'Shigmo Utsav, Ponda', 'Shigmo Utsav Ponda Goa')
-- YES: For ANY beach name (e.g., 'Miramar', 'Baga', 'Calangute', 'Anjuna')
-- YES: For events with a state (e.g., 'Shigmo Utsav, Goa') or city (e.g., 'Shigmo Utsav, Ponda')
-- NO: For events without a specific location (e.g., 'Shigmo Utsav', 'Sunburn')
-- NO: For general concepts ('pizza', 'music'), food items ('momos', 'burger')
+- YES: For ANY city, state, town, or village name (e.g., 'Mumbai', 'Goa', 'Delhi', 'Assagao', 'Ponda').
+- YES: For beaches, waterfalls, forts, temples, churches, landmarks, and specific tourist spots.
+- YES: For restaurants, hotels, clubs, and established businesses.
+- YES: For events that specify a location (e.g., 'Shigmo in Ponda', 'Sunburn in Vagator', 'Carnival in Panjim').
+- NO: For general abstract concepts ('meditation', 'culture', 'history') unless linked to a place.
+- NO: For general food/items ('pizza', 'beer', 'clothes') without a brand/location.
 
 RULES FOR SEARCH QUERY:
-- For events with state (e.g., 'Shigmo Utsav, Goa'): Use only the state name (e.g., 'Goa')
-- For events with city or city and state (e.g., 'Shigmo Utsav, Ponda', 'Shigmo Utsav Ponda Goa'): Use the city name (e.g., 'Ponda')
-- For other Indian locations: Use just the name (e.g., 'Miramar', 'Baga Beach')
-- DO NOT add 'India' or state names unless part of the event location logic
-- The system will automatically prioritize Indian locations
-- For restaurants: Use just the restaurant name
+- Extraction: If the topic is 'Event in Place' (e.g., 'Sunburn in Vagator'), use ONLY the place ('Vagator').
+- Extraction: If the topic contains a specific venue (e.g., 'Pizza at Thalassa'), use the venue name ('Thalassa').
+- Landmarks: For landmarks, use the full name (e.g., 'Aguada Fort').
+- Beaches: Use the beach name + 'Beach' (e.g., 'Baga Beach').
+- Cities/States: Use the name as is (e.g., 'Mumbai', 'Goa').
+- DO NOT add 'India' or extra suffixes; the fetcher will handle that.
+- Keep the query as clean and specific as possible.
 
-IMPORTANT: This is for INDIAN travel guide, so we want Indian locations only.
+IMPORTANT: We want to show a map whenever possible for geographically grounded topics.
 
-Respond ONLY with JSON in this exact format:
-{{"should_fetch": true|false, "search_query": "exact query to use"}}
+Respond ONLY with JSON:
+{{"should_fetch": true|false, "search_query": "specific location string"}}
 If should_fetch is false, search_query should be an empty string.
 '''
     )
@@ -990,16 +1070,40 @@ def teamConfig():
     description_agent = AssistantAgent(
         "description_agent",
         model,
-        description="Writes type-specific descriptions",
-        system_message=f'''You are an expert content writer specializing in travel and tourism as of {current_date}. 
-Write a short, engaging description (1-2 sentences) based on the content type:
-- For PLACES (beach, waterfall, fort, religion): Focus on location, atmosphere, and key features
-- For EVENTS (event, boat-party, entertainment): Highlight timing, experience, and uniqueness
-- For RESTAURANTS (restaurant, dining-fine, dining-casual, dining-family, dining-seafood, dining-bar, dining-chinese): Emphasize cuisine, ambiance, and specialties
-- For BLOGS (blog): Create informative, engaging overviews
-- For ACTIVITIES (water-sport, guide-tour, travel): Highlight activities, experiences, and key features
-Respond ONLY with plain text.
-'''
+        description="Writes type-specific descriptions enriched with real web data",
+        system_message=f'''You are an expert travel content writer specializing in Indian tourism as of {current_date}.
+
+    You will be given:
+    1. A topic (destination, event, restaurant, activity)
+    2. A content type
+    3. Optional: Real factual data scraped from Wikipedia or DuckDuckGo
+
+    YOUR JOB:
+    - If real scraped data is provided, use it as your factual base and rewrite it into an engaging 2-3 sentence travel description.
+    - If no scraped data is provided, write from your own knowledge.
+    - NEVER copy scraped text word for word — always rewrite in a fresh, engaging tone.
+    - ALWAYS mention the location name naturally in the description.
+    - Keep it 2-3 sentences max, punchy and informative.
+
+    TYPE-SPECIFIC TONE:
+    - PLACES (beach, waterfall, fort, religion): Highlight atmosphere, key features, and why it is worth visiting.
+    - EVENTS (event, boat-party, entertainment): Highlight the experience, energy, and what makes it unique.
+    - RESTAURANTS (restaurant, dining-*): Emphasize cuisine, ambiance, and signature dishes.
+    - BLOGS (blog): Informative and helpful overview, like a knowledgeable local friend explaining it.
+    - ACTIVITIES (water-sport, guide-tour, travel): Focus on the thrill, skill level, and experience.
+
+    STRICT RULES:
+    - Output ONLY the final description text. No labels, no JSON, no intro phrases like "Here is the description:".
+    - Do NOT start with "This", "The", or "Located" — start with the place/event name or an action word.
+    - Do NOT include generic filler like "a must-visit destination" or "perfect for all ages".
+    - Maximum 3 sentences.
+    - Write in present tense.
+
+    Example outputs:
+    - "Baga Beach stretches along North Goa's coastline with a lively mix of beach shacks, water sports, and a buzzing nightlife strip just steps from the sand. Known for its energetic atmosphere, it draws backpackers, families, and party-goers alike throughout the year."
+    - "Dudhsagar Falls plunges over 310 metres through dense forest on the Goa-Karnataka border, creating a dramatic milk-white cascade that is one of India's tallest waterfalls. The trek through Mollem National Park to reach the base adds a rewarding adventure element to the visit."
+    - "Shigmo Festival lights up Goa every spring with vibrant street processions, folk performances, and elaborate floats celebrating the state's Hindu heritage. The two-week celebration draws both locals and tourists who gather to witness traditional Goan culture at its most colourful."
+    '''
     )
     tags_agent = AssistantAgent(
         "tags_agent",
@@ -1075,11 +1179,11 @@ Plain text only, no formatting.
         "image_prompt_agent",
         model,
         description="Creates topic-specific image generation prompts",
-        system_message=f'''You are an expert AI image prompt writer specialized in creating descriptive prompts for travel images as of {current_date}.
-Generate a vivid, photorealistic image prompt about the user's provided topic. 
-CRITICAL: The prompt must explicitly include the main name of the place, attraction, or topic.
-Focus on the core subject, lighting, and atmosphere to ensure the image is highly relevant.
-Respond ONLY with the actual prompt text, no quotes or intro.'''
+        system_message=f'''You are an expert AI image prompt writer as of {current_date}.
+Generate a vivid, photorealistic image prompt for the given topic. 
+CRITICAL: The prompt MUST start with "A photorealistic travel image of [TOPIC NAME]..." 
+Focus on specific landmarks, local atmosphere, and cinematic lighting.
+Respond ONLY with the prompt text, no quotes, no intros, no conversation.'''
     )
     thumbnail_prompt_agent = AssistantAgent(
         "thumbnail_prompt_agent",
@@ -1087,7 +1191,8 @@ Respond ONLY with the actual prompt text, no quotes or intro.'''
         description="Creates short thumbnail image prompts",
         system_message=f'''You are an expert at creating concise prompts for travel thumbnails as of {current_date}.
 Generate a short, focused prompt for a square thumbnail representing the provided topic.
-The thumbnail should be instantly recognizable and highly specific to the topic.
+CRITICAL: The prompt MUST start with "[TOPIC NAME] thumbnail..." 
+Focus on an iconic view or detail.
 Respond ONLY with the actual prompt text, no quotes or intro.'''
     )
 
@@ -1218,77 +1323,6 @@ Return ONLY a JSON object in this format:
 
 import random
 import re
-
-def generate_image_pollinations(prompt, filename, width=1024, height=1024, seed=None, model="flux", content_type=None):
-    """
-    Generate an image using Pollinations AI with robust error handling and fallback models.
-    """
-    try:
-        if not prompt or not prompt.strip() or str(prompt) == "None":
-            return "", ""
-            
-        if seed is None:
-            seed = int(time.time() * 1000) % 1000000 + random.randint(1, 1000)
-            
-        # Strip <think> blocks if using DeepSeek-type models
-        prompt_str = str(prompt)
-        prompt_str = re.sub(r'<think>.*?</think>', '', prompt_str, flags=re.DOTALL | re.IGNORECASE).strip()
-        
-        # Add high-quality keywords for better results
-        if "photorealistic" not in prompt_str.lower():
-            prompt_str += ", photorealistic, cinematic lighting, 8k resolution, highly detailed"
-            
-        import urllib.parse
-        encoded_prompt = urllib.parse.quote(prompt_str)
-        
-        # Expanded list of models for better fallback
-        models_to_try = [model, "flux", "turbo", "unity", "dreamshaper", "deliberate"]
-        # Remove duplicates while preserving order
-        models_to_try = list(dict.fromkeys(models_to_try))
-        
-        for current_model in models_to_try:
-            image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width={width}&height={height}&seed={seed}&model={current_model}&nologo=true"
-            
-            # Simple retry mechanism for each model
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    print(f" [IMAGE] Attempting {current_model} (Attempt {attempt+1}/{max_retries})...")
-                    response = requests.get(image_url, timeout=45)
-                    
-                    if response.status_code == 200:
-                        img = Image.open(BytesIO(response.content))
-                        if img.mode != 'RGB':
-                            img = img.convert('RGB')
-                        
-                        data_url = convert_image_to_webp_and_encode_base64(img, target_width=800, target_height=600)
-                        
-                        # Use absolute path for saving
-                        output_path = Path(filename.replace(".png", ".webp"))
-                        img.save(output_path, format="WEBP", quality=80)
-                        
-                        print(f" [IMAGE] Success! Saved to {output_path}")
-                        return data_url, str(output_path)
-                    
-                    elif response.status_code == 429:
-                        print(f" [IMAGE] Rate limited (429). Waiting...")
-                        time.sleep(2 * (attempt + 1))
-                    else:
-                        print(f" [IMAGE] Model {current_model} failed with status {response.status_code}")
-                        break # Try next model
-                        
-                except Exception as inner_e:
-                    print(f" [IMAGE] Model {current_model} error: {inner_e}")
-                    if attempt < max_retries - 1:
-                        time.sleep(1)
-                    else:
-                        break
-                        
-        print(" [IMAGE] All models failed to generate image.")
-        return "", ""
-    except Exception as e:
-        print(f" [IMAGE] Ultimate generation error: {e}")
-        return "", ""
 
     
 # Get type-specific content
@@ -1423,12 +1457,30 @@ Return a single JSON object with the following keys:
     if should_fetch_location:
         location = fetch_location(search_query)
 
-    description = await safe_run(description_agent, f"Generate a short description for {content_type}: {user_topic}")
+    # Scrape first for description
+    wiki_text = fetch_wikipedia_description(user_topic)
+    ddg_text = fetch_duckduckgo_description(user_topic) if not wiki_text else ""
+    scraped = wiki_text or ddg_text or ""
+
+    description_task = f"""
+Topic: {user_topic}
+Content Type: {content_type}
+Scraped Reference Data: {scraped if scraped else "No external data found — generate from your own knowledge."}
+
+Write a travel description following your instructions.
+"""
+    description = await safe_run(description_agent, description_task)
     tags_result = await safe_run(tags_agent, f"Generate 8-12 SEO tags for {content_type}: {user_topic}")
     content = await safe_run(content_agent, f"Generate detailed HTML content for {content_type}: {user_topic}")
     guidelines = await safe_run(guidelines_agent, f"Generate 4-6 guidelines for {content_type}: {user_topic}")
     image_prompt = await safe_run(image_prompt_agent, f"Generate a detailed, vivid image prompt for {user_topic}")
+    if not image_prompt:
+        image_prompt = f"A photorealistic travel image of {user_topic}, cinematic lighting, highly detailed"
+
     thumbnail_prompt = await safe_run(thumbnail_prompt_agent, f"Generate a focused thumbnail prompt for {user_topic}")
+    if not thumbnail_prompt:
+        thumbnail_prompt = f"A professional travel thumbnail showing {user_topic}"
+
     seo_title = await safe_run(seo_title_agent, f"Generate two SEO titles for {content_type}: {user_topic}")
     transportation_options = await safe_run(transportation_options_agent, f"Generate transportation options for {content_type}: {user_topic}")
 
@@ -1539,11 +1591,14 @@ Return a single JSON object with the following keys:
             tags = [user_topic.lower()]
     tags = clean_tags(tags, user_topic, content_type)
 
-    # Generate images
-    main_filename = f"{content_type}-{user_topic.lower().replace(' ', '-')}.png"
-    thumbnail_filename = f"thumbnail-{content_type}-{user_topic.lower().replace(' ', '-')}.png"
-    image_data_url, saved_file = generate_image_pollinations(image_prompt, main_filename, 512, 512, content_type=content_type)
-    thumbnail_data_url, thumbnail_file = generate_image_pollinations(thumbnail_prompt, thumbnail_filename, 256, 256, content_type=content_type)
+    # Fetch images from Unsplash
+    print(f" [IMAGE] Fetching images from Unsplash for '{user_topic}'...")
+    _imgs = fetch_images_unsplash(user_topic, count=2)
+    image_data_url = _imgs[0] if len(_imgs) > 0 else ""
+    thumbnail_data_url = _imgs[1] if len(_imgs) > 1 else image_data_url
+    saved_file = ""
+    thumbnail_file = ""
+
 
     # Set location data
     type_config = get_type_specific_content(content_type, user_topic)
@@ -1561,13 +1616,8 @@ Return a single JSON object with the following keys:
     if should_fetch_location and isinstance(location, dict) and "address" in location and location.get("address") and not location.get("error"):
         place_ids = find_place_ids(location["address"], goa_db)
 
-    gallery_urls = []
-    if image_data_url and image_data_url.startswith("data:image/webp;base64,"):
-        gallery_urls.append(image_data_url)
-    
-    thumbnail_url = []
-    if thumbnail_data_url and thumbnail_data_url.startswith("data:image/webp;base64,"):
-        thumbnail_url.append(thumbnail_data_url)
+    gallery_urls = [image_data_url] if image_data_url else []
+    thumbnail_url = [thumbnail_data_url] if thumbnail_data_url else []
 
     # Build final output
     output = {
@@ -1591,7 +1641,7 @@ Return a single JSON object with the following keys:
         "city": ObjectId(place_ids["city_id"]) if place_ids["city_id"] else None,
         "author": ObjectId(),
         "thumbnail": thumbnail_url,
-        "createdAt": datetime.utcnow(),
+        "createdAt": datetime.now(timezone.utc),
         "rating": 0,
         "likes": 0,
         "views": 0,
@@ -1677,7 +1727,13 @@ async def run_agent_original_with_validation(user_topic: str, more_details: Opti
     content = await safe_run(content_agent, f"Generate detailed HTML content for {content_type}: {user_topic}")
     guidelines = await safe_run(guidelines_agent, f"Generate 4-6 guidelines for {content_type}: {user_topic}")
     image_prompt = await safe_run(image_prompt_agent, f"Generate a detailed, vivid image prompt for {user_topic}")
+    if not image_prompt:
+        image_prompt = f"A photorealistic travel image of {user_topic}, cinematic lighting, highly detailed"
+
     thumbnail_prompt = await safe_run(thumbnail_prompt_agent, f"Generate a focused thumbnail prompt for {user_topic}")
+    if not thumbnail_prompt:
+        thumbnail_prompt = f"A professional travel thumbnail showing {user_topic}"
+
     seo_title = await safe_run(seo_title_agent, f"Generate two SEO titles for {content_type}: {user_topic}")
     transportation_options = await safe_run(transportation_options_agent, f"Generate transportation options for {content_type}: {user_topic}")
     boolean_options = await get_boolean_options(content_type, user_topic, model_full)
@@ -1693,11 +1749,13 @@ async def run_agent_original_with_validation(user_topic: str, more_details: Opti
             pass
     tags = clean_tags(tags, user_topic, content_type)
 
-    # Generate images
-    main_filename = f"{content_type}-{user_topic.lower().replace(' ', '-')}.png"
-    thumbnail_filename = f"thumbnail-{content_type}-{user_topic.lower().replace(' ', '-')}.png"
-    image_data_url, saved_file = generate_image_pollinations(image_prompt, main_filename, 512, 512, content_type=content_type)
-    thumbnail_data_url, thumbnail_file = generate_image_pollinations(thumbnail_prompt, thumbnail_filename, 256, 256, content_type=content_type)
+    # Fetch images from Unsplash
+    print(f" [IMAGE] Fetching images from Unsplash for '{user_topic}'...")
+    _imgs = fetch_images_unsplash(user_topic, count=2)
+    image_data_url = _imgs[0] if len(_imgs) > 0 else ""
+    thumbnail_data_url = _imgs[1] if len(_imgs) > 1 else image_data_url
+    saved_file = ""
+    thumbnail_file = ""
 
     # Use OUR validated location_data â€” DO NOT refetch!
     loc = location_data if location_data else {}
@@ -1735,7 +1793,7 @@ async def run_agent_original_with_validation(user_topic: str, more_details: Opti
         "city": ObjectId(place_ids["city_id"]) if place_ids["city_id"] else None,
         "author": ObjectId(),
         "thumbnail": [thumbnail_data_url] if thumbnail_data_url else [],
-        "createdAt": datetime.utcnow(),
+        "createdAt": datetime.now(timezone.utc),
         **boolean_options
     }
 
@@ -1778,7 +1836,7 @@ async def generate_basic_fallback(user_topic: str, more_details: Optional[str], 
         "city": None,
         "author": ObjectId(),
         "thumbnail": [],
-        "createdAt": datetime.utcnow(),
+        "createdAt": datetime.now(timezone.utc),
         "rating": ObjectId(),
         "likes": ObjectId(),
         "views": ObjectId(),
@@ -1875,7 +1933,20 @@ async def smart_content_generation(user_topic: str, more_details: Optional[str] 
         old_description = existing_doc.get('shortDescription', '')
         if needs_field_update(old_description, user_topic, created_at, is_content_field=False):
             print(" Updating description...")
-            new_description = await safe_run(description_agent, f"Generate a 1-sentence description for {user_topic}")
+            content_type = existing_doc.get('postType', 'blog')
+            # Scrape context
+            wiki_text = fetch_wikipedia_description(user_topic)
+            ddg_text = fetch_duckduckgo_description(user_topic) if not wiki_text else ""
+            scraped = wiki_text or ddg_text or ""
+            
+            description_task = f"""
+Topic: {user_topic}
+Content Type: {content_type}
+Scraped Reference Data: {scraped if scraped else "No external data found — generate from your own knowledge."}
+
+Write a travel description following your instructions.
+"""
+            new_description = await safe_run(description_agent, description_task)
             if new_description and new_description.strip():
                 updated_fields['shortDescription'] = new_description
                 updates_made.append('description')
@@ -1903,35 +1974,44 @@ async def smart_content_generation(user_topic: str, more_details: Optional[str] 
                 updates_made.append('guidelines')
                 print(" Guidelines updated")
         
-        # 5. Check and Update IMAGES if empty
-        old_gallery = existing_doc.get('gallery', [])
-        old_thumbnail = existing_doc.get('thumbnail', [])
+        # 5. Check and Update IMAGES
+        old_gallery = [g for g in existing_doc.get('gallery', []) if g]
+        old_thumbnail = [t for t in existing_doc.get('thumbnail', []) if t]
         
-        if not old_gallery or not old_thumbnail:
-            print(f"[DEBUG] Found missing images for '{user_topic}'. Gallery empty: {not old_gallery}, Thumbnail empty: {not old_thumbnail}")
-            print(" Updating missing images...")
+        # Refresh images if missing OR if location/content was updated (likely a topic correction)
+        should_refresh_images = not old_gallery or not old_thumbnail or 'location' in updates_made or 'text' in updates_made
+        
+        if should_refresh_images:
+            print(f"[DEBUG] Refreshing images for '{user_topic}'. Reason: {'missing' if not old_gallery else 'topic/location update'}")
             content_type = existing_doc.get('postType', 'blog')
             
-            # Generate prompts
+            # Generate prompts with fallbacks
             image_prompt = await safe_run(image_prompt_agent, f"Generate a detailed, vivid image prompt for {user_topic}")
+            if not image_prompt:
+                image_prompt = f"A photorealistic travel image of {user_topic}, cinematic lighting, highly detailed"
+
             thumbnail_prompt = await safe_run(thumbnail_prompt_agent, f"Generate a focused thumbnail prompt for {user_topic}")
+            if not thumbnail_prompt:
+                thumbnail_prompt = f"A professional travel thumbnail showing {user_topic}"
             
-            main_filename = f"{content_type}-{user_topic.lower().replace(' ', '-')}.png"
-            thumbnail_filename = f"thumbnail-{content_type}-{user_topic.lower().replace(' ', '-')}.png"
+                   # Fetch new images from Unsplash
+            print(f" [IMAGE] Fetching images from Unsplash for '{user_topic}'...")
+            unsplash_imgs = fetch_images_unsplash(user_topic, count=2)
+            image_data_url = unsplash_imgs[0] if len(unsplash_imgs) > 0 else ""
+            thumbnail_data_url = unsplash_imgs[1] if len(unsplash_imgs) > 1 else image_data_url
+
+            if image_data_url:
+                updated_fields['gallery'] = [image_data_url]
+                updates_made.append('gallery')
+                print(f" Main image updated from Unsplash")
+
+            if thumbnail_data_url:
+                updated_fields['thumbnail'] = [thumbnail_data_url]
+                updates_made.append('thumbnail')
+                print(f" Thumbnail updated from Unsplash")
             
-            if not old_gallery:
-                image_data_url, saved_file = generate_image_pollinations(image_prompt, main_filename, 512, 512, content_type=content_type)
-                if image_data_url:
-                    updated_fields['gallery'] = [image_data_url]
-                    updates_made.append('gallery')
-                    print(f" Main image generated: {saved_file}")
-            
-            if not old_thumbnail:
-                thumbnail_data_url, thumb_file = generate_image_pollinations(thumbnail_prompt, thumbnail_filename, 256, 256, content_type=content_type)
-                if thumbnail_data_url:
-                    updated_fields['thumbnail'] = [thumbnail_data_url]
-                    updates_made.append('thumbnail')
-                    print(f" Thumbnail generated: {thumb_file}")
+            if not image_data_url and not thumbnail_data_url:
+                print(f" [IMAGE] No images found on Unsplash for '{user_topic}'")
         
         # Update the document if any fields were updated
         if updated_fields:
