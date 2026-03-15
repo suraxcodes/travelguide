@@ -8,7 +8,7 @@ try:
 except ImportError:
     pass  # nest_asyncio not installed; asyncio.run() may raise on some setups
     
-    try:
+try:
     from GoaInsight import smart_content_generation as _smart_content_generation
     _BACKEND_AVAILABLE = True
     st.sidebar.success("✅ Backend loaded OK")
